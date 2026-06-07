@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""
+Xray / DeepSeek API 健康检查脚本。
+每 30 分钟运行一次，发现问题自动报错（不自愈，只报告）。
+"""
+import subprocess, json, sys, os, urllib.request
+
+errors = []
+
+# 1. 检查 Xray
+r = subprocess.run(["systemctl", "--user", "is-active", "xray"], capture_output=True, text=True, timeout=10)
+if r.stdout.strip() != "active":
+    errors.append(f"Xray 状态异常: {r.stdout.strip()}")
+
+# 2. 检查代理端口
+for port, desc in [(10808, "SOCKS"), (10809, "HTTP")]:
+    r = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True, timeout=5)
+    if f":{port}" not in r.stdout:
+        errors.append(f"代理端口 {port} ({desc}) 未监听")
+
+# 3. 检查 DeepSeek API 连通性
+try:
+    with open('/home/ubuntu/.hermes/.env') as f:
+        c = f.read()
+    key = ""
+    for line in c.split('\n'):
+        if line.startswith('DEEPSEEK_API_KEY='):
+            key = line.split('=', 1)[1].strip()
+            break
+    if key:
+        payload = json.dumps({"model":"deepseek-v4-flash","messages":[{"role":"user","content":"ping"}],"max_tokens":5}).encode()
+        req = urllib.request.Request("https://api.deepseek.com/v1/chat/completions", data=payload,
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+    else:
+        errors.append("DeepSeek API Key 未找到")
+except Exception as e:
+    errors.append(f"DeepSeek API 异常: {e}")
+
+# 4. 检查磁盘使用率
+r = subprocess.run(["df", "/"], capture_output=True, text=True, timeout=5)
+for line in r.stdout.split('\n')[1:]:
+    if line.strip():
+        parts = line.split()
+        if len(parts) >= 5:
+            pct = parts[4].rstrip('%')
+            if int(pct) > 85:
+                errors.append(f"磁盘使用率: {pct}%")
+
+# 5. 检查内存
+r = subprocess.run(["free", "-m"], capture_output=True, text=True, timeout=5)
+for line in r.stdout.split('\n'):
+    if line.startswith('Mem:'):
+        parts = line.split()
+        avail = int(parts[6]) if len(parts) > 6 else 0
+        if avail < 100:
+            errors.append(f"可用内存不足: {avail}MB")
+
+# 输出
+if errors:
+    print("HEALTH_CHECK_FAIL")
+    for e in errors:
+        print(e)
+    sys.exit(1)
+else:
+    print("HEALTH_CHECK_PASS")
+    sys.exit(0)
