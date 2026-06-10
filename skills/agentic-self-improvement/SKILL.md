@@ -102,11 +102,20 @@ BENCHMARK → DIAGNOSE → PATCH → VERIFY → (auto-revert if regression)
 
 **1. Benchmark Runner**
 
-Each prompt runs in isolation via `hermes chat --model <model> -q QUERY -Q` as a subprocess. Captures:
-- Tool calls made (detected as "preparing X..." text previews in quiet mode)
+Each prompt runs in isolation via `hermes chat --model <model> -q QUERY -v --max-turns N` as a subprocess. Captures:
+- Tool calls made (detected via `-v` verbose log: parse `Messages: N (1 user, K tool calls)` or `tool_turns=N`)
 - Tool outputs
 - Final response text
 - Exit code
+
+⚠️ **DO NOT use `-Q` (quiet mode)** for benchmark subprocesses. Quiet mode suppresses tool call traces and "preparing X..." previews entirely, making validation impossible. Always use `-v` (verbose) and parse the debug log for tool call evidence.
+
+**Tool call detection from verbose output:**
+- Session summary line: `Messages: N (1 user, K tool calls)` — extract K, verify `K ≥ 1`
+- Debug log line: `tool_turns=N` — check `N ≥ 1`
+- Line: `API call #N: ...` — presence of multiple API calls indicates tool use (first call is the system + user query, subsequent calls carry tool results back)
+
+**Pitfall to avoid:** The regex `\d+\s+tool call` matches "0 tool calls" as well as "1 tool call". Always compare the extracted count to zero, not just test for pattern presence.
 
 **2. Failure Analyzer**
 
@@ -446,3 +455,17 @@ agentic-self-improvement/
     ├── patch_generator.py          # Generate guidance patches
     └── apply_and_verify.py         # Apply patches with auto-revert
 ```
+
+## Pitfalls
+
+- **Benchmark runner path resolution**: When the skill lives under `skills.external_dirs` (shared repo), `benchmark_runner.py` looks for benchmarks in `HERMES_HOME/skills/agentic-self-improvement/BENCHMARKS/` — but the actual benchmarks live in the external dir. Fix: create a symlink once:
+  ```bash
+  ln -sf ~/hermes-skills/skills/agentic-self-improvement ~/.hermes/skills/agentic-self-improvement
+  ```
+  Without this, running `run_benchmark('act_dont_ask')` raises `FileNotFoundError`.
+
+- **Model consistency**: Benchmarks run via `hermes chat -q PROMPT -v --model MODEL` subprocess. If the current session is on a different model, results may not reflect real behavior. Always specify `--model` explicitly.
+- **Timeout on long commands**: Git operations (`git branch -a`, `git log --all`) can hang in subprocess for 45+ seconds. Set `timeout=90` for categories like `prerequisite` that involve git discovery. A stuck `git` may not finish within default limits.
+- **Session context pollution**: A fresh `hermes chat -q QUERY` subprocess still receives system prompt context (host OS, CWD, user home dir from the agent's environment). Prompts like "What OS am I on?" get answered from this context without tool calls. This is **intentional** — the benchmark is checking whether the agent still calls tools despite knowing the answer from context. Low scores on `no_hallucination` categories often come from this exact pattern.
+
+- **Benchmark validation halting**: The `act_dont_ask` category checks for `tool_used: true` with specific commands. An agent that answers correctly from memory (without tools) will fail all prompts — the content may be right but the behavior is wrong. This is intentional: correct answers without verification is the root cause this loop is designed to fix.
