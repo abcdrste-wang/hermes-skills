@@ -1,7 +1,7 @@
 ---
 name: 3d-printing
 description: "Generate FDM-ready 3D printable STL models — one-piece boolean-UNION character models (Blender), multi-part articulated designs (numpy-stl), phone cases, and custom parts. Covers the full pipeline: modeling → boolean merge → flat base plate → STL export → render preview → bed adhesion verification."
-version: 1.1.0
+version: 1.2.0
 author: Hermes Agent
 license: MIT
 platforms: [macos, linux]
@@ -11,18 +11,674 @@ metadata:
     related_skills: [sketch, spike, python-3d-tools, bambu-lab-tips]
 ---
 
-# 3D Printing — Generative STL Models from Python
+# 3D Printing — 实物还原建模专家（正向设计+逆向复刻）
+
+> **定位**：负责所有实物还原建模任务，最终产出合规、可直接切片打印的STL，兼顾精度、拓扑和打印可行性。
+> 
+> 本技能涵盖正向设计（从零建模）和逆向复刻（从实物/参考图还原），输出FDM/光固化可用的STL文件。
+> 
+> 来源：用户系统化知识沉淀（2026-06-08）
+
+## 核心能力体系
+
+### 1. 通用三维基础
+- 三维空间逻辑、坐标系、点/线/面/体拓扑原理
+- 理解流形网格(manifold)、法线方向、拓扑连续（STL硬性要求）
+- 尺寸标注、公差、实体尺寸还原（对标实物长宽高、弧度、卡扣、凹槽）
+- 单位规范：默认毫米制(mm)，熟练切换 mm/inch
+
+### 2. 三大建模流派
+
+**（A）参数化实体建模** — 硬件、标准件、结构件首选
+- 草图约束、特征建模：拉伸、旋转、倒角、圆角、孔、阵列、抽壳、布尔运算
+- 装配逻辑：零件配合、卡扣、螺纹、榫卯、过盈配合
+- 特征修复：处理破面、重叠面、无效布尔
+
+**（B）曲面/多边形建模** — 异形、曲面、有机件、复杂外观
+- 曲面重构：弧面、流线型、不规则轮廓拟合
+- 多边形网格编辑：面合并、删废面、修复非流形、减面/拓扑优化
+- 逆向造型：从实物轮廓/点云反向重建曲面
+
+**（C）椭圆截面堆叠（Lofting）** — 枪械、武器、异形管状件首选
+- 原理：在不同高度（沿Y/Z轴）定义不同大小和形状的椭圆截面，每个截面由椭圆方程控制
+- 优势：比侧面挤压（薄片）产生真实3D体积，比box composite（方块堆叠）更平滑
+- ⚠️ 核心教训：侧面轮廓挤压（side-contour extrusion）无论顶点数多少，做出来都是纸片/薄片效果。FFAR1案例中v3-v5尝试了1465个轮廓点+挤出的方法，260~640面，视觉上"像纸片"。椭圆截面堆叠是替代方案，它能产生真实3D立体感。
+- 适用：需要立体感但不是纯圆柱/圆锥的异形管状物体（枪身、剑柄、能量武器）
+- 不适合：平面特征为主的物体（建筑、机械箱体）
+
+### 3. 逆向还原核心
+- 实物测绘：卡尺测量、轮廓描点、截面提取
+- 点云/扫描数据处理：降噪、精简、对齐、截面提取
+- 逆向重构：点云→轮廓线→曲面/实体
+- 对称重构：利用对称性减半工作量
+
+### 4. STL 专项合规（对接3D打印）
+- STL标准：三角面片、封闭壳体、无破洞、无重叠面、法线统一朝外
+- 模型检查：识别修复破面、悬空面、交叉面、零面积三角面、内壁穿透
+- 壁厚设计：FDM ≥1.2mm，树脂 ≥0.6mm
+- 支撑预判：悬空/悬挑结构优化或预留支撑位
+- 模型轻量化：合理减面不损外形
+
+### 5. 切片&打印适配
+- 区分FDM/光固化两种工艺，针对性优化模型
+- 模型分件、卡扣拼接设计（过打印机尺寸时）
+- 拔模角度、公差补偿（0.1-0.2mm装配间隙）
+
+### 6. 顶级进阶能力
+- 拓扑优化：减重、加强筋布局
+- 误差修正：±0.1mm 精度控制
+- 多格式互转：STEP/IGS/OBJ/STL
+- 批量处理：批量修复/导出/减面
+- 故障排错：切片报错、断层、翘边、坍塌
+
+## 🧠 AI视觉模型能力表（3D建模用）
+
+当`vision_analyze`用于审查3D渲染图和参考图时，不同模型有显著差异：
+
+| 模型 | 适用场景 | 可靠性 | 已知问题 |
+|------|---------|--------|---------|
+| **GLM-4v-Flash（智谱）** | 图片概览、分类判断 | ★★☆ | 三维几何参照幻觉严重——报告"没有枪口制退器"但图中明显可见；报告"看不到弹匣"但侧面明显可见。会同时编造「存在」和「不存在」的部件 |
+| **Qwen3-VL-Plus（阿里百炼）** | 多模态视觉理解、空间感知 | ★★★☆ | 需DashScope API Key（sk-sp-xxx格式，通过DASHSCOPE_API_KEY或ALIBABA_API_KEY环境变量配置）。效果优于GLM-4v但非免费。不可用于精确尺寸测定<br><br>**⚠️ ACL/GPCR 幻觉**: 当渲染图中有棱角/网状结构时，Qwen3-VL-Plus 可能将其误认为生物分子结构（蛋白质/GPCR）。FFAR1 武器渲染曾被误判为 "GPCR 蛋白结构"——因为 FFAR1 本身是一个真实存在的游离脂肪酸受体蛋白，模型将视觉上与已知文字"FFAR1"关联。评估成品渲染时必须同时提供原始参考图。 |
+| **DeepSeek文本模型** | ❌ 无视觉能力 | — | 不能用来看图 |
+
+**关键经验：** 所有AI视觉模型在推断3D几何时都可能产生幻觉。**绝对不可以以vision_analyze说的"这个部件不存在"作为不建模的依据。** 部件存不存在要以参考图为准（B站截图、官方概念图），AI判断只能做概览。
+
+视觉模型配置位于 `auxiliary.vision` 段，对应的API Key在 `.env` 中设置。**关键修复：国内DashScope Key必须修改 `auth.py` 中硬编码的国际版Base URL** — 详情见 `hermes-agent` 技能的 `references/alibaba-dashscope-domestic-key-fix.md`。
+
+```yaml
+# config.yaml — 阿里百炼 Qwen3-VL-Plus 作为视觉模型
+auxiliary:
+  vision:
+    provider: alibaba
+    model: qwen3-vl-plus
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+```
+`.env` 中设置 `DASHSCOPE_API_KEY=sk-sp-xxx...`（阿里百炼专属格式）。
+
+```yaml
+# config.yaml — 智谱 GLM-4v-Flash 作为视觉模型（免费备选）
+auxiliary:
+  vision:
+    provider: zai
+    model: glm-4v-flash
+    base_url: https://open.bigmodel.cn/api/paas/v4/
+```
+`.env` 中设置 `GLM_API_KEY=xxx...`（bigmodel.cn 标准格式）。
+
+**切换注意：** 主模型（`model.provider`）必须保持 `deepseek`，不能改成 `alibaba` 或 `zai`。视觉模型独立于主模型配置，只影响 `vision_analyze()` 的调用。
+
+## 安装状态（2026-06-08 当前）
+
+| 工具 | 状态 | 安装命令 | 说明 |
+|------|------|---------|------|
+| **trimesh 4.12.2** | ✅ 已装 | `pip3 install trimesh networkx` | 自动化质检：水密性、体积、组件分析、STL repair、几何体生成 |
+| **Blender 5.1.2** | ✅ 已装 | `/Applications/Blender.app` | 全套建模+渲染 |
+| **numpy-stl 3.2.0** | ✅ 已装 | `pip3 install numpy-stl` | 纯 Python 几何体组合 |
+| **networkx 3.2.1** | ✅ 已装 | 随 trimesh 自动安装 | 图分析依赖 |
+| **UltiMaker Cura 5.13.0** | ✅ 已装 | `brew install --cask ultimaker-cura` | 切片软件，内置 STL 修复（补洞、水密检查、可打印性验证） + 可作临时实体预览替代渲染 |
+| **CadQuery 2.5.2** | ❌ 未装 | GFW 下 `pip3 install cadquery` 超时（casadi 42MB + OCP C++绑定） | 参数化 CAD 零件卡扣/齿轮/连接件 |
+| **f3d** | ❌ 未装 | GFW 下 `brew install f3d` 超时 | 快速 STL 预览（0.5s vs Blender 3-5s） |
+| **scipy** | ❌ 未装 | GFW 下超时 | trimesh 的 body_count 检测依赖 |
+| **openscad** | ❌ 未装 | `brew install openscad` | 参数化规则件 |
+| **Meshmixer** | ❌ 已停维护 | 已从官网/brew下架，无安装方式 | ❌ 不再可用。替代：Bambu Studio/Cura 内置修复 + trimesh Python 修复 |
+
+> **当前工作流**: trimesh 做所有自动化质检和修复，Blender 做精细建模+渲染，numpy-stl 做快速几何体生成。缺少 CadQuery 时，参数化功能零件用 Blender bmesh 替代。缺少 f3d 时，Blender EEVEE 渲染替代预览。
+>
+> **一键安装脚本**: `bash ~/.hermes/scripts/install_3d_tools.sh`（走代理+国内镜像，可能需要多次尝试）
+
+## 软件工具栈
+
+### 主力建模（二选一主用）
+
+**方案A — 工业参数化路线**（机械/标准件/结构实物首选）
+- **Fusion 360**（首推）：参数化+自由曲面+逆向一体，原生STL导入导出
+- 备选：SolidWorks（精密机械装配）
+
+**方案B — 多边形/曲面路线**（异形/艺术品/手办/曲面实物首选）
+- **Blender**（首推）：免费开源，多边形网格编辑、曲面重塑、拓扑重构
+- 备选：Rhino（工业曲面王者，NURBS→STL精度极高）
+
+### 逆向扫描&点云处理
+- **MeshLab**（免费必备）：降噪、精简、对齐、截面提取
+- **CloudCompare**（免费）：高精度点云对齐、误差比对
+- 商用：Geomagic Design X（工业级点云→实体全自动逆向）
+
+### STL 修复/校验（打印零报错核心）
+- **Meshmixer** ❌ 已停维护（2026起不可安装）—— 替代方案见下方
+- **Bambu Studio / Orca Slicer** ✅ 内置STL修复、壁厚检测、支撑生成（免费跨平台）—— Meshmixer 最佳替代
+- **UltiMaker Cura** ✅ 内置STL修复、切面检测
+- **Netfabb**：工业级STL检查、拓扑修复（需Windows/企业许可证）
+
+### 切片软件（验证STL可用性）
+- **Cura**：FDM通用
+- Chitubox / Lychee Slicer：光固化
+
+### 硬件外设
+- 数显卡尺（0.01mm精度）
+- 三维扫描仪：桌面级→手持式→工业级
+- 轮廓规、高度规、角度尺
+
+### 插件
+- Blender: 3D Print Toolbox, Remesh
+- Fusion 360: 扫描逆向插件
+- MeshLab: 批量修模脚本
+
+> **快速导航**：如果你不确定当前在哪个流程节点、该查哪个参考文件，先打开 `references/hermes-3d-modeling-expert-playbook.md` —— 那是整个技能体系的"导航地图"，5 分钟定位到对应的文件和流程步骤。
+
+## 标准工作流
+
+### 流程1：手动测绘复刻（无扫描仪）
+```
+实物测量 → 草图绘制 → 参数化实体/曲面建模 → 检查壁厚/结构 → 导出STL → Meshmixer修复 → Cura校验 → 交付打印
+```
+
+### 流程2：三维扫描逆向复刻（高精度）
+```
+实物扫描 → 点云→CloudCompare/MeshLab降噪/对齐 → 导入Fusion/Blender重构 → 结构优化(壁厚/支撑/分件) → STL导出+修复 → 切片验证 → 交付
+```
+
+## 推荐软件组合
+
+| 方案 | 建模 | 逆向/修模 | 切片 | 场景 |
+|------|------|-----------|------|------|
+| **全能免费栈** | Fusion 360 + Blender | MeshLab + Meshmixer | Cura | 个人/小型场景，覆盖90% |
+| **工业高精度** | SolidWorks / Rhino | Geomagic + CloudCompare | Netfabb | 精密零件、商用 |
+| **艺术/手办** | Blender + Rhino | MeshLab | Meshmixer + Lychee | 文创、雕塑、异形件 |
+
+## 🔄 STL 文件接收协议 — 用户丢来一个 .stl/3mf 文件时
+
+**场景**: 用户通过聊天直接发给你一个 STL 文件（可能包含关键词 `TEMI`/`single_color`/`stl`），但没有说明要做什么。
+
+**规则：不要直接跑完整流水线。** 先问清楚需求。用户可能只是：
+- 想你看一眼是什么模型（无需处理）
+- 想让你优化/减面/缩放
+- 想让你改模型（加特征、修破面、改尺寸）
+- 只是发文件作为参考，没要求处理
+
+**推荐的确认方式（多选模式）：**
+> 你发了一个 STL 文件（xx万面，xxMB，约 xxxmm 尺寸）。你想怎么处理？
+> 1️⃣ 就看一眼是什么模型
+> 2️⃣ 减面优化+修复
+> 3️⃣ 调整尺寸/缩放
+> 4️⃣ 改模型结构
+> 
+> 或者直接说用途
+
+只有用户明确表态后再开流水线。如果用户只回了一个符号（如 `？`），说明你做过头了——老实承认，不用解释。
+
+## 🏆 Expert Position: Own the full pipeline
+
+**Hard rule: When the user gives you a 3D modeling task, you are THE expert. Do NOT ask the user which tools are needed, whether a tool is "enough", or what approach to take.** The user has made this expectation explicit: "你是一个3D建模专家，你要自己找工具完成".
+
+This means:
+- **You decide** what tools are needed (Blender + Cura + trimesh = current stack)
+- **You decide** when a tool is "enough" (Cura's auto-repair suffices for minor non-manifold issues)
+- **You decide** the workflow sequence (analyze → fix → validate → preview)
+- **You report** status and results, not ask permission for tool choices
+- If you need a new tool, research it yourself, install it yourself, then use it
+
+**例外情况**：只有当工具需要付费、需要用户执行GUI操作（如扫码登录）、或涉及用户硬件购买决策时才问用户。纯工具/工作流选择不关用户的事。
+
+**Fallback protocol** (when your current toolset genuinely cannot solve the problem):
+1. Research alternative approaches via web_search immediately (do not iterate failed approach)
+2. If the fix needs a new tool, install it yourself and test it
+3. If the fix is fundamentally beyond software (physical hardware needed), state the limitation factually and offer a workaround
+
+## 🛠️ STL 编辑工作流 — 在已有的 STL 上做修改（加/减特征）
+
+**场景**: 用户发来一个现有的 STL 文件（如 Bambu AI 生成的白模、下载的模型、别人发的文件），要求在上面做修改：加洞、切掉一部分、加新特征、合并另一模型等。
+
+**这是与「从零建模」截然不同的工作流。** 不要把编辑任务当作建模任务从零开始。
+
+### Phase 0: 检查任务性质
+
+用户说的"改模型"可能包含多种任务类型，必须先确认：
+
+| 任务类型 | 用户会说 | 工作流 |
+|---------|---------|-------|
+| **减法**（切掉/删除部件） | "三枪口改一个" "削高留矮" "去掉这个尖尖" | Bisect/顶点删除 + 网格填充 |
+| **加法**（加新零件） | "加个碟片" "加耳朵" "加个底座" | 新建 miniface + extrude 或 add primitive 再合并 |
+| **切割保留**（保留另一部分） | "切掉枪口，保留主体" "只留前一半" | Bisect clear_inner/clear_outer |
+| **缩放/修改尺寸** | "放大20%" "壁厚改到1.2mm" | Scale 变换 + shell/reduce |
+| **合并**（两个文件合一） | "把枪管和枪身合并" | 分别导入后 join |
+
+### Phase 1: 分析原模型
+
+**编辑前，必须先了解模型的尺寸、方向、关键位置。** 这步做错了后面全白费。
+
+```bash
+python3 -c "
+import numpy as np
+for fname in ['your_model.stl']:
+    with open(fname, 'rb') as f:
+        data = f.read()
+    num_tris = int.from_bytes(data[80:84], 'little')
+    verts = []
+    for i in range(num_tris):
+        offset = 84 + i * 50
+        for j in range(3):
+            v = np.frombuffer(data[offset+12+j*12:offset+24+j*12], dtype=np.float32)
+            verts.append(v)
+    verts = np.array(verts)
+    print(f'{fname}: {num_tris} tris')
+    print(f'  X: {verts[:,0].min():.1f} ~ {verts[:,0].max():.1f}  (range: {verts[:,0].ptp():.1f})')
+    print(f'  Y: {verts[:,1].min():.1f} ~ {verts[:,1].max():.1f}  (range: {verts[:,1].ptp():.1f})')
+    print(f'  Z: {verts[:,2].min():.1f} ~ {verts[:,2].max():.1f}  (range: {verts[:,2].ptp():.1f})')
+    print(f'  Volume: {verts[:,:].ptp(axis=0).prod():.0f} mm³ (approx bbox)')
+    print(f'  Centroid: ({verts[:,0].mean():.1f}, {verts[:,1].mean():.1f}, {verts[:,2].mean():.1f})')
+"
+```
+
+### Phase 2: 编辑策略
+
+**核心原则: 使用 bmesh 直接操作，不要用 modifier（headless 下 modifier_apply 静默失败）。**
+
+因 Blender headless 模式下 modifier 的 apply 操作会静默失败（BOOLEAN/MIRROR/SUBSURF/BEVEL 全部受影响），编辑已有 STL 时必须使用 bmesh 直接操作顶点/边/面。
+
+#### 减法模式（切掉/删除部分顶点区域）
+
+```python
+import bpy, bmesh, math
+
+# 1. 导入 STL
+bpy.ops.wm.stl_import(filepath='input.stl')
+obj = bpy.context.object
+me = obj.data
+
+# 2. 进入 bmesh 编辑模式
+bpy.context.view_layer.objects.active = obj
+bpy.ops.object.mode_set(mode='EDIT')
+bm = bmesh.from_edit_mesh(me)
+bm.verts.ensure_lookup_table()
+bm.edges.ensure_lookup_table()
+bm.faces.ensure_lookup_table()
+
+# 3. 选择目标区域 (示例: 删除 Y>49 的所有顶点 — 枪口端)
+target_verts = [v for v in bm.verts if v.co.y > 49.0]
+bmesh.ops.delete(bm, geom=target_verts, context='VERTS')
+
+# 4. 封口 — grid fill 自动三角剖分开口
+# 先找到开口边（只属于一个面的边）
+open_edges = [e for e in bm.edges if len(e.link_faces) == 1]
+# 用 fill 封成大面，再三角剖分
+bmesh.ops.grid_fill(bm, edges=open_edges, mat_nr=0, use_smooth=True, use_interp_simple=True)
+# 或者用 hole_fill（更简单但可能质量差）
+# bmesh.ops.holes_fill(bm, edges=open_edges)
+
+# 5. 写入
+bmesh.update_edit_mesh(me)
+bpy.ops.object.mode_set(mode='OBJECT')
+```
+
+#### 加法模式（添加新零件到已有模型）
+
+```python
+# 在已有 STL 上加新零件
+
+# 1. 创建新零件作为独立 mesh
+new_mesh = bpy.data.meshes.new("NewPart")
+bm2 = bmesh.new()
+verts = [
+    bm2.verts.new((x1, y1, z1)),
+    bm2.verts.new((x2, y2, z2)),
+    # ...
+]
+bm2.faces.new(verts)  # 按需要构建面
+bm2.to_mesh(new_mesh)
+bm2.free()
+
+new_obj = bpy.data.objects.new("NewPart", new_mesh)
+bpy.context.collection.objects.link(new_obj)
+
+# 2. 用 join 合并到主模型（不要用布尔 UNION — headless 下 BOOLEAN modifier apply 静默失败）
+bpy.ops.object.select_all(action='DESELECT')
+obj.select_set(True)
+new_obj.select_set(True)
+bpy.context.view_layer.objects.active = obj
+bpy.ops.object.join()  # 简单合并，允许内部重叠面
+# ⚠️ 这会产生内部面（不是水密模型），但对 3D 打印通常可接受
+# 打印前在 Bambu Studio/Cura 中会自动处理重叠区域
+
+# 3. 或者用 trimesh 做布尔 UNION（Python 非 Blender 方式）
+# pip3 install trimesh
+import trimesh
+import numpy as np
+
+main = trimesh.load('input.stl')
+# 创建新零件 mesh
+new_part = trimesh.Trimesh(vertices=..., faces=...)
+# 布尔 UNION — 合并为一个水密网格
+result = trimesh.boolean.union([main, new_part])
+result.export('output.stl')
+```
+
+#### 先减法再加法（完整编辑模式）
+
+```python
+# FFAR1 武器模型编辑实例 (500K faces):
+# 任务: 1)切掉三枪口→改单枪口 2)削瞄准镜高尖 3)加碟片
+
+# Step A: 导入 + 分析
+bpy.ops.wm.stl_import(filepath='bambu_model.stl')
+obj = bpy.context.object
+
+# Step B: 删除枪口端区域
+bpy.ops.object.mode_set(mode='EDIT')
+bm = bmesh.from_edit_mesh(obj.data)
+bm.verts.ensure_lookup_table()
+# 选中 Y>49 的所有顶点
+del_verts = [v for v in bm.verts if v.co.y > 49.0]
+print(f"Deleting {len(del_verts)} vertices on muzzle end")
+bmesh.ops.delete(bm, geom=del_verts, context='VERTS')
+# 封口
+bm.edges.ensure_lookup_table()
+open_edges = [e for e in bm.edges if len(e.link_faces) == 1]
+bmesh.ops.grid_fill(bm, edges=open_edges, mat_nr=0, use_smooth=True)
+bmesh.update_edit_mesh(obj.data)
+bpy.ops.object.mode_set(mode='OBJECT')
+
+# Step C: 添加新零件（枪口帽 — 半圆球）
+bpy.ops.mesh.primitive_uv_sphere_add(radius=8.5, location=(0, 50, 4))
+cap = bpy.context.object
+# 做半球：在编辑模式删除上半部分
+bpy.ops.object.mode_set(mode='EDIT')
+# ... 选择删除部分顶点
+
+# Step D: 削瞄准镜 — 删除尖顶区域
+# 选中 Z>15 的顶点并删除
+
+# Step E: 加碟片 — 创建圆柱或圆环并 join
+bpy.ops.mesh.primitive_cylinder_add(radius=3.5, depth=1, location=(6.5, 20, 4))
+
+# Step F: 全部 join
+bpy.ops.object.select_all(action='DESELECT')
+main_obj.select_set(True)
+for part in [cap, disc]:
+    part.select_set(True)
+bpy.context.view_layer.objects.active = main_obj
+bpy.ops.object.join()
+
+# Step G: 导出
+bpy.ops.wm.stl_export(filepath='output.stl', export_selected_objects=True)
+```
+
+### Phase 3: 暴力验证 — 编辑后的 STL 面数/体积/位置检查
+
+编辑操作后**必须**立刻做检查，这是最常见出问题的地方：
+
+```python
+# 检查编辑后 STL 的面数、体积、顶点范围是否合理
+import numpy as np
+fname = 'edited_model.stl'
+with open(fname, 'rb') as f:
+    data = f.read()
+num_tris = int.from_bytes(data[80:84], 'little')
+verts = []
+for i in range(num_tris):
+    offset = 84 + i * 50
+    for j in range(3):
+        v = np.frombuffer(data[offset+12+j*12:offset+24+j*12], dtype=np.float32)
+        verts.append(v)
+verts = np.array(verts)
+ranges = [verts[:,i].ptp() for i in range(3)]
+
+# 诊断
+problems = []
+if num_tris < 50:
+    problems.append(f"面数暴跌: {num_tris} — 模型几乎被删光了")
+if ranges[2] < 1.0:
+    problems.append(f"Z 方向仅 {ranges[2]:.1f}mm — 模型被压扁/平躺？")
+if verts[:,2].mean() < -10:
+    problems.append(f"质心在 Z={verts[:,2].mean():.1f} — 相机默认角度拍不到")
+
+print(f"面数: {num_tris} {'✅' if num_tris > 1000 else '⚠️'}")
+print(f"体积(bbox): {ranges[0]*ranges[1]*ranges[2]:.0f} mm³")
+print(f"XYZ范围: {ranges[0]:.1f} x {ranges[1]:.1f} x {ranges[2]:.1f}")
+if problems:
+    for p in problems:
+        print(f"❌ {p}")
+else:
+    print("✅ 基本检查通过")
+```
+
+### ⚠️ 编辑 STL 常见陷阱
+
+| 陷阱 | 表现 | 修复 |
+|------|------|------|
+| Bisect 方向反了 | 切出来体积只剩 100mm³（原来 5000mm³）—— 主体被删了 | `clear_inner=True` 删除平面内侧的区域；`clear_outer=True` 删除外侧。先确认哪个方向是"枪口方向" |
+| 删除顶点后网格破裂 | 面数正常但模型有洞/非流形 | 使用 `bmesh.ops.grid_fill()` 封口，不要手动捏面 |
+| 零件添加后 stuck inside | 面数增加了但体积没变化 | 新零件完全在主模型内部（穿透但未超出边界）—— 需把新零件位置放在模型表面 |
+| 原模型面数太大 | 50万面，Blender 操作很慢 | 对原模型用 `bmesh_subdivide_for_smoothness` 降面（多用在 trimesh 中做简化） |
+| 用户用3点清单表达需求 | "三个主要问题：1. X 2. Y 3. Z" | 这是精确指令，不能自己加额外要求。用户说"中间不需要特效"就是不需要，不用自作主张 |
+
+---
+
+## Phase 0: 查工具+定方案（建模前必须执行）
+
+### 📦 Render Preview 方案矩阵（按M4无独显环境）
+
+用户通过飞书/Telegram看到渲染图。渲染不佳=你白做了。**这是用户反馈最频繁的瓶颈。**
+
+### 渲染引擎选择
+
+| 方案 | 速度 | 质量 | 适用场景 | 备注 |
+|------|------|------|---------|------|
+| **2D线框投影（stl_2d_preview.py）** | ⚡ <1s | ★★ | 形状/结构验证 | 首选，可靠，无GPU依赖 |
+| **Cura切片预览截图** | ⚡ 2s | ★★★ | 形状/打印可行性验证 | 🆕 2026-06发现的新方案：Cura带模型修复功能，切片后可看实体轮廓 |
+| **Blender EEVEE headless** | 🐢 3-5s | ★ | ❌ M4无独显下全灰不可用 | 已证明不可靠，跳过 |
+| **Blender Cycles CPU** | 🐌 30-60s | ★★★★★ | 最终展示用 | 需要时才开，太慢不适合迭代 |
+
+**2026-06新确认的策略：Cura可以充当临时渲染替代**，它导入STL后带实体填充预览，能看到模型轮廓和比例关系，不受GPU限制。与2D线框图互补使用。
+
+## 🔧 工具盘点（首次接到建模任务时主动检查）
+
+**建模开始前，先检查系统中到底有什么可用工具（不只是"写了什么"），避免重复使用错误的工具链。**
+
+```bash
+# 核心工具
+which blender               # 是否有 Blender
+blender --version 2>&1      # 版本
+
+# Python 库
+pip3 list 2>/dev/null | grep -iE 'numpy-stl|trimesh|cadquery|pillow|open3d|pyrender|vedo'
+
+# 预览工具
+which f3d openscad meshlab  # 快速预览/参数化
+
+# 安装状态（按用户体系）
+echo "参数化路线: $(which openscad cadquery 2>/dev/null | tr '\n' ' ')"
+echo "STL修复: $(pip3 list 2>/dev/null | grep -i 'trimesh')"
+echo "快速预览: $(which f3d 2>/dev/null)"
+```
+
+**如果检查发现关键工具缺失，向用户报告缺失清单并建议一次性安装，不要绕路用低效替代方案。**
+
+| 缺失工具 | 安装命令 | 缺失时的影响 |
+|---------|---------|------------|
+| trimesh | `pip3 install trimesh networkx` | 无法做自动化质检（水密性、体积、组件分析），只能绕 Blender |
+| f3d | `brew install f3d` | STL 预览需开 Blender 渲染（3-5s vs 0.5s） |
+| openscad | `brew install openscad` | 参数化规则件只能用 Blender 慢慢捏 |
+| cadquery | `pip3 install cadquery` | 无 Python 参数化 CAD，几何体全靠 Blender bmesh |
+| Meshmixer | 官网下载 | 无专业 STL 修复/分件工具 |
+
+---
+
+## Phase 0: 查工具+定方案（建模前必须执行）
 
 Use this skill when the user wants to **3D print a custom object** — an articulated toy, a functional part, a decorative model — and asks you to create the STL file(s). The approach uses `numpy-stl` to build geometry from basic primitives (sphere, cylinder, cone, extrusion) and export as `.stl` files ready for Bambu Studio / Orca Slicer / Cura.
 
 ## When to use this
 
 - User says "design a 3D model of X" or "make something I can print"  
-- User has a Bambu Lab / Creality / Prusa / Anycubic FDM printer  
+- User has a Bambu Lab / Creality / Prusa / Anykubic FDM printer  
 - The model can be **one-piece** (single STL, boolean-UNION merged — preferred for maximum simplicity)  
 - Multi-part articulated designs (joints, hinges, snap-fits) — export as separate STL files only if user explicitly asks for movable parts  
 - Phone cases (foldable or single-back) using the numpy-stl extrusion pattern  
 - The model can be approximated as **combinations of basic geometric shapes** (spheres, cylinders, cones, extrusions) when using numpy-stl  
+
+## Phase 0: Check available tooling FIRST (before modeling anything)
+
+**This is the single most important step and the most common source of wasted iterations.** Before writing a single line of modeling code:
+
+```
+1. CHECK what 3D tools are installed on the system:
+   which blender          # /Applications/Blender.app → FULL 3D SUITE
+   which openscad         # Precision CAD
+   pip3 list | grep trimesh  # Mesh analysis + repair
+   pip3 list | grep cadquery  # Parametric CAD
+
+2. CHOOSE the right tool for the model class:
+
+   | Model type | Correct tool | Wrong tool (waste of time) |
+   |-----------|-------------|---------------------------|
+   | | Weapons (guns, swords, mecha) | **Blender bpy — elliptical cross-section stacking (lofting)** (see `references/weapon-side-profile-extrusion.md` and `references/elliptical-lofting-weapon.md`) for side-profile extrusion **OR** elliptical cross-section stacking (better 3D depth, fewer fallbacks required). If the side-profile extrusion produces a flat/stamp-like result (thin slice, user says "看不出立体感"), switch to **elliptical cross-section stacking** (see `references/elliptical-lofting-weapon.md`). | numpy-stl box composition → produces blocky unrecognizable shapes |
+   | Characters/animals/organic | **Blender bpy** (subdivision surfaces) | numpy-stl sphere/cylinder combos → faceted, ugly |
+   | Phone cases, simple boxes | numpy-stl (fast, no deps) | Blender (overkill startup time) |
+   | Multi-part articulated joints | Blender bpy (better tolerance control) | numpy-stl (no boolean ops) |
+   | Geometric/angular (buildings, crates) | Either (numpy-stl is faster) | — |
+
+3. **If Blender is installed, USE IT for anything curved/complex.** Weapons, characters, vehicles, and any model where the user says "看不出样子" requires Blender. numpy-stl cannot produce recognizable weapon shapes — period. The box composition technique is only acceptable for: phone cases, simple jewelry boxes, geometric abstract art, or models where the user explicitly says "方块风格就行".
+
+4. **If Blender is NOT installed, install it:**
+   brew install --cask blender
+   # Then proceed with Blender pathway below
+
+5. **If neither Blender nor numpy-stl can handle the complexity**, tell the user honestly what's possible vs. what needs a professional tool (Fusion 360, Nomad Sculpt, etc.)
+```
+
+### 🚨 HARD STOP Signal: When user says the model is unrecognizable
+
+**This is the single most costly waste pattern in 3D modeling — iterating the same approach 3+ times while user keeps saying "看不出来".**
+
+**Hard-stop trigger phrases from this user:**
+- "看不出来是枪" / "看不出来是啥东西"
+- "都离谱，都看不出来像一把X"
+- "没法给你精确的解释哪个地方做的不对"
+
+**Protocol (NO EXCEPTIONS):**
+1. **STOP IMMEDIATELY** — do NOT produce another iteration of the same approach
+2. **DO NOT ask "what specifically is wrong?"** — the user already told you: the whole thing is unrecognizable, which means the modeling approach itself is wrong, not a detail
+3. **Research the alternative modeling approach first** (Phase 0 of systematic-debugging skill)
+4. **Switch to a fundamentally different method**, not just tweaked parameters:
+   - Box composition → **Side-profile extrusion** (for weapons/mecha)
+   - numpy-stl → Blender bmesh (for curved/organic)
+   - Blender bmesh → CadQuery/Fusion 360 (for precision parts)
+5. Only after the new approach is ready → produce one new version and send
+
+**Common failure pattern (what happened in this user's session):**
+```
+v1 (780 box-composite faces) → user: "差距太大"
+v2 (276 box-composite faces) → user: "看不出枪的样子"
+v3 (5712 subdivided box-composite faces, 2× before/after renders) → user: "都离谱"
+→ THEN finally switched to side-profile extrusion → v4 (49 faces, correct silhouette)
+```
+**The problem was never the number of faces or the render quality.** It was the box-composition approach itself — no amount of subdivision makes boxes into a gun silhouette.
+
+### ⚠️ MANDATORY: Analyze reference image BEFORE extracting contours
+
+**🚨 HARD RULE: Before extracting ANY contour from a reference image, use vision_analyze to check what the actual shape IS. Do NOT assume the reference image matches your mental model of the target object.**
+
+**Why this is critical:**
+- Bambu AI/MakerWorld point cloud references are **3D surface approximations of photos**, not accurate category-level representations. The AI may generate "a gun" that looks like an energy blade/saber because it doesn't understand object categories.
+- Reference images may be rotated (gun pointing "up" instead of forward) or from ambiguous angles
+- A "枪" reference may actually be a "刃" (blade) — as happened with FFAR1 "无境空刃" — wasting hours of contour extraction + extrusion work
+
+**Protocol:**
+
+```
+1. vision_analyze(ref_image, question="这是[目标物体类别]的参考图吗？提取轮廓会得到什么形状？这个形状和[目标物体]一致吗？")
+
+2. If the visual model says the silhouette does NOT match the target:
+   → STOP contour extraction
+   → Report finding to user with specific description of what the silhouette actually is
+   → Ask user to confirm: "这张参考图的轮廓看起来更像[X]，不是[Y]。你想继续按参考图的形状做，还是用其他参考？"
+
+3. If user confirms it's the right reference despite mismatch:
+   → Accept user's judgment and proceed
+   → Document the shape discrepancy in modeling notes
+
+4. If user says they have other/cleaner references:
+   → Request the new references before starting any modeling
+```
+
+**Real case (无境空刃 FFAR1, 2026-06-09):**  The side-view point cloud reference extracted to a maple-leaf/energy-blade silhouette, not a gun shape. Four Python scripts (v3-v4-v5) and hours of iteration were spent before discovering the reference image fundamentally was NOT a gun. The name "空刃" (empty blade) literally describes a blade, not a firearm.
+
+####  Orientation Ambiguity Protocol: When vision models give contradictory answers
+
+**Scenario**: You upload a reference image and ask "which direction is up/forward?" -- different vision_analyze calls give different answers. This happened with FFAR1 where one call said "tip points up-left", another said "tip points right, blade curves down".
+
+**Protocol:**
+
+1. **Do NOT ask about the object's category name** (e.g. "is this a gun?") -- vision models will say "yes" to almost anything if the prompt primes them toward that category.
+
+2. **Ask only about geometry** -- "Where is the sharpest/thickest part? Describe the outline shape without naming it."
+
+3. **Use neutral language** -- "Describe the overall shape and direction of the object in this image. Where does the narrowest part point?"
+
+4. **If answers still contradict** → the reference image is genuinely ambiguous. Do NOT proceed with contour extraction. Instead:
+   - Ask the user: "这张参考图的形状我看不太清方向。枪口（最细的一端）应该朝哪个方向？是朝上还是朝前？"
+   - Or provide a simple sketch of what the contour looks like and ask user to confirm orientation
+   - Better to slow down and ask than to run 4 scripts with wrong orientation
+
+5. **After user confirms orientation** → only then extract contours. Save the confirmed orientation to memory.
+
+### Phase 1: Research the reference object FIRST (critical for game/character models)
+
+**Do NOT start modeling based solely on user-provided photos or AI-generated references.** AI-generated references (Bambu Studio AI, MakerWorld point clouds) can produce fundamentally wrong silhouettes — see `references/ai-generated-reference-ambiguity.md` for the full detection protocol.
+
+**Do NOT start modeling based solely on user-provided photos.** User photos are often ambiguous, poorly lit, or from unrecognizable angles. Especially common pitfalls:
+- User says "it's a gun" but the photos are of **Space Engineers spaceships** that only vaguely resemble a gun
+- User knows the in-game name (e.g. "无境空刃" = FFAR1 mythic skin from CODM) but the photos they took don't match
+- The object is a **licensed game skin/character** with detailed official reference available online
+
+### ⚠️ Critical: User photos may show a COMPLETELY WRONG object
+
+**Also critical: AI-generated reference images (Bambu Studio AI, MakerWorld) can produce fundamentally ambiguous silhouettes.** The AI doesn't understand the object category — it generates a 3D surface approximation of the input photo. A reference image described as "a gun" may actually be an energy blade/saber shape. See `references/ai-generated-reference-ambiguity.md` for the full pattern, detection protocol, and hard rules.
+
+### ⚠️ Critical: User photos may show a COMPLETELY WRONG object
+
+**This is the single most common reason for wasted iterations in 3D modeling.** User-provided photos are often NOT of the object they want modeled. Real scenario from this user's history: a child sent 6 photos of Space Engineers spaceships saying "help me make a 3D model", said it was "a gun" when asked, and only later revealed the actual object was a CODM weapon skin — the photos were completely unrelated spaceships.
+
+**Protocol when photos seem wrong:**
+
+1. **SUSPECT ISOLATION**: If the photos show something that looks like a different category (spaceship vs. gun, movie character vs. real person, abstract vs. recognizable), DO NOT assume the user knows what they sent.
+2. **DIRECT VERIFICATION**: Ask explicitly: "你发的这几张图确实是你想要的那个的模型截图吗？还是这是你在别处找的参考图？"
+3. **WHEN USER ADMITS UNCERTAINTY** (they'll say "难度极其大" "可能不清晰"): Follow Bilibili research workflow; their photos are secondary at best.
+4. **WHEN USER INSISTS it's correct**: Accept their word but mention online reference looks different — offer to re-model if first attempt doesn't match.
+
+**Signals the user's photos are likely wrong:** User says "难度极其大" about modeling, photos show different geometry than known game skin, user says "去上网搜索，因为我的三视图可能不清晰", photos from game screenshot (not 3D viewer), child/kid profile user.
+
+### Research workflow
+
+```
+1. ASK the user for the exact name of the object (in-game name, brand, series)
+2. SEARCH Chinese gaming platforms first (Bilibili is best for CODM/Genshin/etc. — bypasses Baidu/Google CAPTCHA)
+   → Search Bilibili: https://search.bilibili.com/all?keyword=<name>
+   → Look for: 4K展示/无UI/检视换弹 videos (clean display videos without UI overlay)
+   → Also search: 纸板手工/手工制作 (papercraft videos show solid understanding of structure)
+3. CAPTURE video cover images as visual reference:
+   - Extract image URLs from Bilibili search results via browser_get_images
+   - Analyze multiple covers with vision_analyze to build 3D understanding
+   - Prioritize: 4K展示 > 游戏内截图 > 转盘预告 > 手工还原
+4. For each image, ask vision_analyze specifically about:
+   - Overall shape and silhouette
+   - Color distribution (primary + accent)
+   - Structural parts: barrel, grip, stock, magazine, muzzle device
+   - Special effects (glow, particles, animated elements — note these for aesthetics, skip for STL)
+5. Triangulate: Compare ALL available references before building — the user's original photos + at least 2-3 online reference images
+6. Only then start geometry building
+- Child user (kid profile) sending photos | Higher likelihood of proxy references; ask for exact name |
+
+### Reference types prioritized
+
+| Source | Quality | Availability |
+|--------|---------|-------------|
+| Bilibili 4K无UI展示视频封面 | ★★★★★ | Always (no CAPTCHA) |
+| Bilibili 纸板手工视频封面 | ★★★★☆ | Shows physical structure |
+| Official concept art / key art | ★★★★★ | Often behind Baidu CAPTCHA |
+| Game wiki pages | ★★★☆☆ | May need CAPTCHA |
+| In-game screenshots (user-provided) | ★★★☆☆ | Depend on user's phone quality |
+| YouTube thumbnails | ★★★★☆ | Good when Bilibili doesn't have it |
 
 ## Default: prefer one-piece over multi-part
 
@@ -93,7 +749,130 @@ def _rotate_y(m, angle_deg, cx=0, cy=0, cz=0):
     return m
 ```
 
-### 3. Multi-part articulated design pattern
+### 4b. Box-primitive composition for weapon/mecha/geometric models
+
+**Use when**: Building models with flat-sided geometry — guns, weapons, mecha, robots, vehicles, architectural forms, or any object where straight lines and right angles dominate.
+
+This is a **pure numpy-stl** technique (no Blender needed, no sphere/cylinder math) that builds everything from rectangular boxes:
+
+```python
+def box_mesh(sx, sy, sz, cx, cy, cz):
+    """Generate a solid rectangular box mesh centered at (cx,cy,cz)"""
+    sx2, sy2, sz2 = sx/2, sy/2, sz/2
+    pts = np.array([
+        [cx-sx2, cy-sy2, cz-sz2], [cx+sx2, cy-sy2, cz-sz2],
+        [cx+sx2, cy+sy2, cz-sz2], [cx-sx2, cy+sy2, cz-sz2],
+        [cx-sx2, cy-sy2, cz+sz2], [cx+sx2, cy-sy2, cz+sz2],
+        [cx+sx2, cy+sy2, cz+sz2], [cx-sx2, cy+sy2, cz+sz2],
+    ])
+    faces = np.array([
+        [0,1,2],[0,2,3],[4,6,5],[4,7,6],
+        [0,5,1],[0,4,5],[2,6,7],[2,7,3],
+        [0,3,7],[0,7,4],[1,5,6],[1,2,6],
+    ])
+    m = mesh.Mesh(np.zeros(len(faces), dtype=mesh.Mesh.dtype))
+    for i, fi in enumerate(faces):
+        for j in range(3):
+            m.vectors[i][j] = pts[fi[j]]
+    return m
+
+def add_box(parts, sx, sy, sz, cx=0, cy=0, cz=0):
+    """Add a box to a parts list for later combine()"""
+    parts.append(box_mesh(sx, sy, sz, cx, cy, cz))
+
+def combine(parts):
+    """Merge a list of meshes into one STL"""
+    total = sum(len(m.vectors) for m in parts)
+    c = mesh.Mesh(np.zeros(total, dtype=mesh.Mesh.dtype))
+    off = 0
+    for m in parts:
+        n = len(m.vectors)
+        c.vectors[off:off+n] = m.vectors
+        off += n
+    return c
+```
+
+**Design pattern (weapon model example):**
+
+```python
+def build():
+    parts = []
+    # Coordinate convention: Y = long axis (forward/barrel), X = width, Z = thickness
+    
+    # === BARREL (Y: 1.8 to 5.2) ===
+    add_box(parts, 0.26, 3.4, 0.26, 0, 3.4, 0)      # main barrel
+    add_box(parts, 0.30, 0.4, 0.30, 0, 4.6, 0)       # flared end
+    add_box(parts, 0.52, 0.06, 0.52, 0, 4.8, 0)      # muzzle ring
+    
+    # barrel vent ridges (repeat pattern along Y)
+    for i in range(5):
+        y = 2.2 + i * 0.45
+        add_box(parts, 0.34, 0.04, 0.08, 0.20, y, 0)
+        add_box(parts, 0.34, 0.04, 0.08, -0.20, y, 0)
+    
+    # === HANDGUARD (Y: 1.0 to 2.8) ===
+    add_box(parts, 0.60, 1.8, 0.50, 0, 1.9, 0)
+    # top rail
+    add_box(parts, 0.44, 1.4, 0.10, 0, 2.0, 0.30)
+    # side grooves
+    for i in range(6):
+        y = 1.15 + i * 0.25
+        add_box(parts, 0.44, 0.02, 0.06, 0, y, 0.30)
+    
+    # === RECEIVER (Y: -0.3 to 1.2) ===
+    add_box(parts, 0.60, 1.5, 0.56, 0, 0.4, 0)
+    add_box(parts, 0.08, 0.9, 0.06, 0, 0.5, 0.36)   # top rail
+    add_box(parts, 0.12, 0.20, 0.04, 0.22, 0.6, 0.34)  # ejection port
+    
+    # === GRIP (Y: -0.8 to 0.0) — stepped blocks ===
+    for i in range(6):
+        yp = -0.65 + i * 0.12
+        w = 0.26 - i * 0.01
+        add_box(parts, w, 0.10, 0.30, 0.05 + (-0.02)*(i+1), yp, 0)
+    
+    # === MAGAZINE (Y: -0.9 to -0.3) ===
+    add_box(parts, 0.28, 0.55, 0.24, 0, -0.60, 0)
+    add_box(parts, 0.32, 0.05, 0.28, 0, -0.88, 0)  # mag bottom
+    
+    # === STOCK (Y: -2.2 to -0.4) ===
+    add_box(parts, 0.38, 1.4, 0.24, 0, -1.5, 0)
+    add_box(parts, 0.44, 0.10, 0.30, 0, -2.2, 0)  # butt plate
+    
+    return parts
+
+parts = build()
+combined = combine(parts)
+
+# Center and scale to ~85mm
+combined.vectors -= combined.vectors.mean(axis=(0, 1))
+mx = np.max(np.abs(combined.vectors))
+combined.vectors *= 42.5 / mx  # half of target length
+
+combined.save('weapon.stl')
+```
+
+**When to use box composition vs sphere/cylinder:**
+
+| Approach | Best for | Example models |
+|----------|----------|---------------|
+| **Box composition** | Geometric/flat-sided shapes | Guns, vehicles, buildings, mecha, tools |
+| **Sphere/cylinder** | Organic/smooth shapes | Animals, characters, toys, ergonomic grips |
+| **Hybrid** | Combination objects | Gun with organic grip (box for barrel, cylinder/cone for grip) |
+
+**Key advantages of box composition:**
+- Zero math — just pick (sx, sy, sz) dimensions and (cx, cy, cz) placement
+- Easy to iterate — adjust a single number and regenerate
+- Naturally FDM-friendly (flat faces minimize overhangs)
+- Runs in pure numpy-stl, no Blender, no trimesh, no heavy deps
+- Fast even for many parts (89 boxes = ~1068 faces, 52KB STL)
+
+**Limitations:**
+- No curved surfaces — all faces are flat
+- Overlapping boxes create internal faces (not manifold — but FDM can still print them)
+- Cannot do boolean operations (composite parts sit inside each other)
+- Preview via 2D point cloud is rough — visual AI cannot recognize the shape from point cloud alone; user must view STL directly
+
+### 5. Multi-part articulated design pattern
 
 For movable-joint models (articulated toys, action figures):
 
@@ -136,6 +915,22 @@ Use Pillow to generate a **2D annotated preview** with:
 - **Side view** (profile): show body proportions, leg positions
 - **Top view** (plan): show width proportions, ear positions
 - Metadata panel: file list, dimensions, print settings, assembly instructions
+
+**Preferred workflow**: Always use the reusable `scripts/stl_2d_preview.py` script for preview generation. It reads binary STL directly, projects triangles onto 2D planes (front/side/top/iso), and draws with PIL. No Blender startup overhead.
+
+```bash
+# Quick preview:
+python3 /path/to/skills/creative/3d-printing/scripts/stl_2d_preview.py model.stl --output-prefix preview
+
+# All 4 views:
+python3 stl_2d_preview.py model.stl -o model -v front side top iso
+
+# For large files (>20K triangles), sample 10%:
+python3 stl_2d_preview.py model.stl --sample 0.1 -o model
+```
+
+**Why prefer 2D line-art over Blender EEVEE rendering for headless:**
+Even with correct camera Euler angles, proper lighting (3+ area lights), bright red/blue materials, and light background, Blender headless EEVEE renders on Mac Mini M4 (16GB, no dedicated GPU) produce **uniformly flat gray images** that AI vision cannot identify. The 2D line-art approach consistently produces recognizable outlines regardless of GPU or headless mode limitations. **For weapon/mecha models, use `stl_2d_preview.py` as the primary preview method** and only fall back to Blender EEVEE for color/texture previews if the user specifically requests them.
 
 ### 6. One-piece character/organic model via Blender（布尔 UNION 一体式）
 
@@ -537,6 +1332,130 @@ def export_stl(obj, filepath):
 
 `bmesh` 比 `bpy.ops.mesh.*` 快得多，适合在脚本中创建复杂几何体：
 
+#### ⚠️ Blender headless 下的BMesh关键模式：subdivide替代SUBSURF modifier
+
+在Blender headless模式（`blender --background --python ...`）中，**任何modifier的apply操作可能静默失败**——包括SUBSURF(细分曲面)、MIRROR(镜像)、BOOLEAN(布尔)、ARRAY(阵列)。Modifier"应用"前后的模型完全相同，但无报错。这是Blender 5.x在headless模式下已知的行为。
+
+**替代方案：使用bmesh直接操作顶点/边/面进行细化和对称复制，完全不依赖modifier。**
+
+```python
+import bpy
+import bmesh
+import math
+import numpy as np
+
+def bmesh_subdivide_for_smoothness(obj, iterations=2, use_smooth=True):
+    \"\"\"
+    替代SUBSURF modifier的bmesh subdivide方案。
+    通过bmesh.subdivide_edges循环细分，直接在网格几何体上增加面数。
+    效果等同SUBSURF levels=1~2，但无需modifier apply。
+    
+    Args:
+        obj: Blender mesh object
+        iterations: 细分次数。1次≈4x面数，2次≈16x面数
+        use_smooth: 是否设置平滑着色
+    \"\"\"
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    
+    me = obj.data
+    bm = bmesh.from_edit_mesh(me)
+    bm.edges.ensure_lookup_table()
+    
+    for _ in range(iterations):
+        edges = list(bm.edges)
+        bmesh.ops.subdivide_edges(
+            bm,
+            edges=edges,
+            cuts=1,              # 每条边切1刀 → 面数4x
+            smooth=0.0,          # 不偏移顶点位置
+            fractal=0.0,
+            use_smooth_even=True
+        )
+        bm.edges.ensure_lookup_table()
+    
+    bmesh.update_edit_mesh(me)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    
+    if use_smooth:
+        for poly in obj.data.polygons:
+            poly.use_smooth = True
+    return obj
+
+def bmesh_symmetrize_mirror(obj, mirror_axis='X'):
+    \"\"\"
+    替代MIRROR modifier的bmesh手动镜像方案。
+    只建左半侧 → 复制顶点并镜像到右侧 → 合并。
+    这需要在建模脚本中就只生成左半侧顶点(X<=0)。
+    \"\"\"
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    me = obj.data
+    bm = bmesh.from_edit_mesh(me)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    
+    axis_idx = {'X': 0, 'Y': 1, 'Z': 2}[mirror_axis]
+    original_verts = list(bm.verts)
+    
+    mirror_map = {}
+    for v in original_verts:
+        co = v.co.copy()
+        if abs(co[axis_idx]) > 0.001:
+            new_co = co.copy()
+            new_co[axis_idx] = -new_co[axis_idx]
+            mirror_map[v] = bm.verts.new(new_co)
+    
+    # 复制边
+    for e in list(bm.edges):
+        v1, v2 = e.verts
+        if v1 in mirror_map and v2 in mirror_map:
+            bm.edges.new([mirror_map[v1], mirror_map[v2]])
+        elif v1 in mirror_map:
+            bm.edges.new([mirror_map[v1], v2])
+        elif v2 in mirror_map:
+            bm.edges.new([v1, mirror_map[v2]])
+    
+    # 复制面（翻转法线）
+    for f in list(bm.faces):
+        new_fv = []
+        flip = False
+        for v in f.verts:
+            if v in mirror_map:
+                new_fv.append(mirror_map[v])
+                flip = True
+            else:
+                new_fv.append(v)
+        if len(new_fv) >= 3:
+            try:
+                bm.faces.new(list(reversed(new_fv)) if flip else new_fv)
+            except ValueError:
+                pass
+    
+    bmesh.ops.remove_doubles(bm, verts=list(bm.verts), dist=0.001)
+    bmesh.update_edit_mesh(me)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    return obj
+```
+
+**适用场景：**
+
+| modifier | bmesh替代方案 | 适用 | 
+|----------|-------------|------|
+| SUBSURF | `bmesh_subdivide_for_smoothness(obj, iterations=N)` | 提面数、平滑网格 |
+| MIRROR | `bmesh_symmetrize_mirror(obj)` | 左右对称，需先在脚本中只建左半侧 |
+| BOOLEAN (UNION/DIFFERENCE) | `bmesh.ops.bisect_plane` + 手动三角剖分 | 复杂，建议把零件合并写在一个脚本中避免布尔 |
+| BEVEL | `bmesh.ops.bevel(bm, geom=[e for e in bm.edges], offset=0.5, segments=4)` | 倒角 |
+
+**面数控制经验（以武器模型为例）：**
+- 基础形状：圆柱/圆锥使用 `segments=24-32`（不是默认的16）
+- subdivide 1次：4x面数（24 segments → ~96 segments，足够平滑）
+- subdivide 2次：16x面数（谨慎使用，可能50K+面）
+- 目标：武器模型 3000-5000 三角面，角色模型 5000-8000 三角面
+- 超过1万面 = STL文件 500KB+，对IM传输不友好
+
+`bmesh` 比 `bpy.ops.mesh.*` 快得多，适合在脚本中创建复杂几何体：
+
 ```python
 import bpy
 import bmesh
@@ -679,6 +1598,132 @@ def repair_mesh(obj):
     bpy.ops.import_mesh.stl(filepath='/tmp/repaired.stl')
     return bpy.context.object
 ```
+
+## 🛠️ 大 STL 水密性修复工作流 — Blender edit-mode 手动修复
+
+**场景**: 用户发来的 STL 或你建模导出的 STL 有边界边（非水密），trimesh 自动修复失败（`fill_holes()` 返回 False），需要 Blender 手动修复。
+
+**经验来源**: 50 万面 FFAR1 武器模型，2604 条边界边，trimesh 自动修复全部无效，Blender edit-mode 修复成功。
+
+### 修复前诊断
+
+```bash
+# 快速检测水密+边界边数
+python3 -c "
+import trimesh, sys
+m = trimesh.load(sys.argv[1])
+euler = len(m.vertices) + len(m.faces) - m.edges_unique.shape[0]
+boundary = len([e for e in m.edges_unique if e in m.edges_sl]
+                if hasattr(m, 'edges_sl') else [])
+print(f'水密: {m.is_watertight}')
+print(f'边界边: {m.edges_unique.shape[0] - len(m.edges_sl) if hasattr(m, \"edges_sl\") else \"N/A\"}')
+print(f'欧拉数: {euler} (2=流形)')
+print(f'非流形边: {len([e for e in m.edges_unique if m.face_adjacency[e]]) if hasattr(m, \"face_adjacency\") else \"N/A\"} ')
+" model.stl
+```
+
+### 修复阈值判断
+
+| 边界边数 | 策略 | 预期 |
+|---------|------|------|
+| < 50 条 | trimesh `fill_holes()` 可能成功 | 10 秒完成，✅ |
+| 50-500 条 | 尝试 Blender 自动补洞 + remove doubles | 5 分钟，⚠️ 需人工核查 |
+| > 500 条 | **必须用 Blender edit-mode 手动修复**，trimesh 对大洞无效 | 参见下方流程，⚠️ 60%+ 可成功 |
+
+### Blender edit-mode 修复流程（已验证于 50 万面 STL）
+
+```python
+import bpy, bmesh
+
+def repair_watertight_edit_mode(input_stl, output_stl):
+    \"\"\"
+    使用 Blender edit-mode 修复大 STL 的水密性。
+    原理：select_non_manifold → 删除边界边所在的面 → remove_doubles → fill_holes
+    不需要 modifier（避免 headless 下 modifier_apply 静默失败）
+    \"\"\"
+    # 1. 导入
+    bpy.ops.wm.stl_import(filepath=input_stl)
+    obj = bpy.context.object
+    me = obj.data
+    
+    # 2. 进入 edit-mode
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    
+    # 3. 选中非流形顶点并删除其所在面
+    bpy.ops.mesh.select_all(action='DESELECT')
+    bpy.ops.mesh.select_non_manifold()
+    # 扩展选区到关联面
+    bpy.ops.mesh.select_mode(type='FACE')
+    bpy.ops.mesh.select_linked()
+    
+    # 4. 删除选中面
+    bpy.ops.mesh.delete(type='FACE')
+    
+    # 5. 回到顶点模式，合并重叠顶点
+    bpy.ops.mesh.select_mode(type='VERT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.remove_doubles(threshold=0.0001)
+    
+    # 6. 补洞
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.fill_holes(sides=64)  # 64 边限制足够
+    
+    # 7. 回到 object 模式
+    bpy.ops.object.mode_set(mode='OBJECT')
+    
+    # 8. 验证
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.edges.ensure_lookup_table()
+    non_manifold = [e for e in bm.edges if not e.is_manifold]
+    bm.free()
+    print(f"Non-manifold after fix: {len(non_manifold)}")
+    
+    # 9. 导出
+    bpy.ops.wm.stl_export(filepath=output_stl)
+    return len(non_manifold) == 0
+
+# 使用
+success = repair_watertight_edit_mode(
+    '/path/to/bambu_fixed.stl',
+    '/path/to/watertight_final.stl'
+)
+print(f"水密修复{'成功' if success else '失败，残留非流形边'}")
+```
+
+### 修复后验证
+
+```python
+import trimesh, sys
+m = trimesh.load(sys.argv[1])
+print(f"✅ 水密: {m.is_watertight}")
+print(f"✅ 面数: {len(m.faces):,}")
+print(f"✅ 体积: {m.volume:.1f} mm³")
+
+bound_edges = m.boundary_edges()
+print(f"边界边: {len(bound_edges)}" + (" ✅ 无水密问题" if len(bound_edges)==0 else " ⚠️"))
+
+# 如果边界边>0但非流形边=0：trimesh 和 Blender 判断有差异，通常可打印
+```
+
+### ⚠️ trimesh vs Blender 水密性判断差异
+
+**观测事实（50 万面 STL 实测，2026-06-08）：**
+
+| 工具 | 修复前 | 修复后 | 备注 |
+|------|-------|-------|------|
+| Blender select_non_manifold | 17 条非流形边 | 0 条 | ✅ |
+| trimesh `is_watertight` | False | False | ❌ 仍报 False |
+| trimesh `boundary_edges()` | 2604 条 | 0 条 | ✅ |
+| trimesh 多余非流形边（4-face shared） | 5 条 | 5 条 | ⚠️ 微小重叠面 |
+
+**结论：当 `blender非流形=0` 且 `trimesh边界边=0` 时，模型对 Bambu Studio/Cura 切片完全安全。** trimesh 报告的额外非流形边（4-face 共享边，重叠面厚度 < 0.001mm）不影响打印，切片软件会自动处理。**不要因此继续迭代修复**——会陷入无限循环。
+
+**经验教训（50万面 STL，2604 条边界边实测）：**
+- `fill_holes()` 返回 False → trimesh 自动修复能力远弱于宣传，对小洞（<100 边界边）有效，对大面积破面无效
+- `convex_hull()` 缺 scipy 直接抛异常——这不是可选依赖，对某些修复路径是必须的
+- **真正的替代方案：** Cura / Bambu Studio 的自动修复（GUI），或 Blender 手动补面
 
 ### 4. CadQuery 集成 — 精确参数化零件
 
@@ -861,7 +1906,159 @@ def split_for_printing(obj, cut_axis='Z', cut_height=0):
 
 ## EEVEE 渲染优化（headless 模式）
 
-### ⚠️ 渲染可见性 — 避免"全黑图"的首要原则
+### 🚨 EEVEE World Background Color Rendering Bug (M4 iGPU)
+
+**OBSERVED FACT**: EEVEE world background node color does NOT render at the value you set.
+
+| Set in node | Actual pixel output | |
+|------------|-------------------|-|
+| 0.95 gray (RGB 242,242,242) | ~0.74-0.77 (RGB 189-196) | Light background renders as medium gray |
+| 0.15 dark gray | ~0.08-0.12 | Dark renders even darker |
+
+**Impact**: If you set material Base Color to 0.5 (to contrast against 0.95 background), the actual contrast in rendered image is only ~5%, making the model nearly invisible against background. The user will see "一片灰色" with no distinguishable object.
+
+**Fix**: Always use a **physical white plane** (not world background) as the backdrop:
+```python
+# Instead of relying on world bg:
+# World node (unreliable on M4):
+# bg_node.inputs['Color'].default_value = (0.95, 0.95, 0.95, 1.0)
+
+# Use a physical plane instead:
+bpy.ops.mesh.primitive_plane_add(size=500, location=(0, 0, -1))
+plane = bpy.context.object
+plane.name = "Background"
+mat = bpy.data.materials.new("BgMat")
+mat.use_nodes = True
+mat.node_tree.nodes['Principled BSDF'].inputs['Base Color'].default_value = (1.0, 1.0, 1.0, 1.0)
+plane.data.materials.append(mat)
+```
+And set material Base Color to at least 0.15-0.3 (dark gray) for the model, not 0.5.
+
+### 🚨 Fail-Fast Rule: EEVEE renders turn monochrome → stop immediately
+
+**OBSERVED BEHAVIOR (3 separate render attempts in one session):**
+
+When rendering a weapon model (140mm × 18mm × 46mm) with Blender EEVEE headless on Mac Mini M4:
+
+| Attempt | Material | Background | Lights | Result |
+|---------|----------|-----------|--------|--------|
+| 1 | Gray matte 0.75 | World bg 0.95 | 3× Area (600/300/200) | Object blends into bg (< 5px difference), user: "看不到全貌" |
+| 2 | Dark gray 0.15 + White plane 500×500 | World bg 0.95 | 3× Area (1500/500/300) | 100% uniform dark render (0% background pixels detected) |
+| 3 | Dark gray 0.15 + White plane | World bg 0.95 | 3× Area (1500/500/300) + PERSP camera | Same: 100% uniform dark |
+
+**Root cause**: EEVEE headless on M4 integrated GPU has unpredictable rendering behavior with Area lights. The white background plane (500×500) was not receiving enough light to appear white. The actual pixel values ranged only 184-207 across the entire image — barely 23 levels of dynamic range in an 8-bit image.
+
+**Fail-Fast Rule（必须在渲染失败一次后执行）:**
+
+```python
+# After first render attempt that looks bad to user:
+from PIL import Image
+import numpy as np
+img = Image.open('render.png')
+arr = np.array(img.convert('L'))
+dynamic_range = arr.max() - arr.min()
+print(f"Dynamic range: {dynamic_range}")
+if dynamic_range < 50:
+    print("FAIL-FAST: EEVEE render is monochrome. Skip EEVEE iterations.")
+    print("→ Switch to line-art preview (stl_2d_preview.py)")
+    # Do NOT adjust: materials, camera position, background color, lighting
+    # The render engine itself is the bottleneck
+```
+
+**Do NOT enter a render tuning loop** (adjusting camera → contrast → materials → lights → re-render → user still can't see → repeat). This wastes 3+ cycles with zero improvement. Instead:
+1. Immediately generate `stl_2d_preview.py` line-art (front/side/iso views)
+2. Send line-art to user for structure verification
+3. If user insists on color render, use Cycles (not EEVEE) — but warn it takes 30-60s per frame
+4. Accept that M4 iGPU headless EEVEE cannot produce high-contrast renders for long/thin objects
+
+#### 🚨 Blender EEVEE 渲染在 Mac Mini M4 上的局限性
+
+⚠️ **2026-06-09 更新：Blender 5.1.2 完全不可用**
+
+在 Blender 5.1.2 (hash ec6e62d40fa9, built 2026-05-19) 上，EEVEE 的 `--background` 渲染输出 **#000000 纯黑帧**（1920×1080）。所有场景元素（灯光、材质、相机、环境色）配置正确，渲染日志无错误，但输出文件为空帧。这比之前的"灰度缺陷"更严重——是完全不可用。
+
+**硬规定**：默认使用 `scripts/stl_2d_preview.py`（PIL + 面法线着色 + 三点光源）进行任何视觉预览。仅在用户明确要求时尝试 EEVEE，且渲染后必须自动检测（if std < 50 → 回退 PIL）。
+
+**观测事实（经过本用户环境多次验证）：**
+
+Blender headless EEVEE 在 Mac Mini M4 (16GB, 无独显) 上渲染 3D 模型时，输出图像存在**一致性缺陷**：
+
+| 问题 | 表现 | 根本原因 |
+|------|------|---------|
+| 颜色不准 | 深色材质渲染为浅灰色 | EEVEE 在 headless 下材质采样偏差 |
+| 光照扁平 | 多盏 Area 光源看不出立体感 | 软光在无独显 GPU 下衰减异常 |
+| 对比度低 | 物体与背景差异小 | 整个渲染画面趋向均匀灰色 |
+| 构图难控制 | ORTHO 长细物体（140mm×18mm）100% 填满画面 | 相机自动对焦算法未考虑纵横比悬殊的物体 |
+
+**策略：对于所有需要用户视觉审核的模型，优先使用 2D 线框/三角面预览，Blender EEVEE 仅作为"补充彩色参考"，不作为主要审核手段。**
+
+```python
+# 决策矩阵：选择预览方式
+# 1. 形状/结构审核 → stl_2d_preview.py (2D 线框投影) — 可靠、快、不依赖 GPU
+# 2. 尺寸/比例审核 → trimesh 或 numpy-stl 分析 bounding box
+# 3. 彩色/质感展示 → Blender EEVEE（但告知用户可能颜色不准）
+# 4. 最终用户审核 → 直接发 STL 文件给用户在本地查看
+```
+
+### 🚨 新增: 模型物理尺寸 < 50mm 时的相机策略
+
+**场景**: 用户发来的 STL 只有几厘米甚至几毫米（如 TEMI 模型仅 8mm 宽 × 100mm 长 × 28mm 高），Blender 渲染全黑。
+
+**问题**: Blender EEVEE 渲染时，默认相机距离可能设置为 `max_dim * 1.5`，当模型很小（如 8mm 宽）时，相机距离仅 0.15m，但 Blender 的 STL 导入坐标系单位为米，200mm 以上的相机距离 → 模型在画面中变成米粒大 → 背景白 → 用户看到"全黑"或"全白"。
+
+**诊断脚本（渲染前必须执行）**:
+```python
+import numpy as np
+fname = 'your_model.stl'
+with open(fname, 'rb') as f:
+    data = f.read()
+num_tris = int.from_bytes(data[80:84], 'little')
+verts = []
+for i in range(num_tris):
+    offset = 84 + i * 50
+    for j in range(3):
+        v = np.frombuffer(data[offset+12+j*12:offset+24+j*12], dtype=np.float32)
+        verts.append(v)
+verts = np.array(verts)
+ranges = [verts[:,i].max()-verts[:,i].min() for i in range(3)]
+print(f'尺寸: {ranges[0]:.1f}x{ranges[1]:.1f}x{ranges[2]:.1f}mm')
+print(f'质心Z: {verts[:,2].mean():.1f}')
+```
+
+**相机距离公式（按模型大小分档）:**
+
+| 模型最大尺寸 | 相机距离 | 镜头焦距 | 适用场景 |
+|-------------|---------|---------|---------|
+| 5-50mm | `max_dim * 2.5` | 50mm | 小零件、微缩模型 |
+| 50-200mm | `max_dim * 1.5` | 50mm | 标准打印件 |
+| 200mm+ | `max_dim * 1.2` | 35mm | 大件（避免裁切） |
+
+```python
+# 正确的相机设置
+max_dim = max(obj.dimensions.x, obj.dimensions.y, obj.dimensions.z)
+if max_dim < 0.05:        # < 50mm
+    cam_dist = max_dim * 2.5
+    lens = 50
+elif max_dim < 0.20:      # 50-200mm
+    cam_dist = max_dim * 1.5
+    lens = 50
+else:                      # > 200mm
+    cam_dist = max_dim * 1.2
+    lens = 35
+
+cam.data.lens = lens
+cam.location = (cam_dist * 0.4, -cam_dist * 0.8, cam_dist * 0.3)
+```
+
+**渲染前的自我验证（发送用户前必须做）**:
+```python
+from PIL import Image
+import numpy as np
+img = Image.open('render.png')
+arr = np.array(img.convert('L'))
+print(f'渲染亮度均值: {arr.mean():.1f}')
+assert arr.mean() > 30, "❌ 渲染很可能全黑，调整相机/灯光"
+```
 
 > **这是本技能中最容易出现"用户说看不到图"的部分。以下规则经过了 OPPO Find N5 手机壳 8 次迭代的教训验证，必须遵守。关键教训：渲染失败时先查 STL 文件本身，而非盲目切换渲染引擎。**
 
@@ -1212,12 +2409,194 @@ blender --background --python render_views.py
 
 这与 `python-3d-tools` 技能、`bambu-lab-tips` 技能互补使用。
 
+## 超大 STL 快速预览协议（跳过 Blender，>5万面时使用）
+
+当 STL 文件超过 5 万面（约 2.5MB+），Blender 导入+渲染耗时 >30 秒，且容易因为模型尺寸/位置问题导致全黑。**此时应先用 Python 直接读二进制 STL 画 2D 线框预览，确认模型形状正确后，再用 Blender 做精细渲染。**
+
+```python
+from PIL import Image, ImageDraw
+import numpy as np, math
+
+def stl_to_2d_preview(stl_path, output_path, scale=2.0, sample_ratio=1.0):
+    """
+    二进制 STL → 2D 线框预览（不依赖 Blender）
+    sample_ratio: 对超大文件(>100万面)可设 0.1 采样10%加速
+    """
+    with open(stl_path, 'rb') as f:
+        data = f.read()
+    num_tris = int.from_bytes(data[80:84], 'little')
+    
+    # 对超大文件随机采样
+    if sample_ratio < 1.0:
+        import random
+        rng = random.Random(42)
+        sample_indices = set(rng.sample(range(num_tris), int(num_tris * sample_ratio)))
+    else:
+        sample_indices = None
+    
+    # 计算质心和范围用于自动缩放
+    all_verts = []
+    for i in range(min(5000, num_tris)):
+        offset = 84 + i * 50
+        for j in range(3):
+            v = np.frombuffer(data[offset+12+j*12:offset+24+j*12], dtype=np.float32)
+            all_verts.append(v)
+    all_verts = np.array(all_verts)
+    center = all_verts.mean(axis=0)
+    max_range = max(all_verts.ptp(axis=0))
+    auto_scale = 800 / max_range if max_range > 0 else 1.0
+    
+    img_size = 1200
+    img = Image.new('RGB', (img_size, img_size), 'white')
+    draw = ImageDraw.Draw(img)
+    
+    tri_count = 0
+    for i in range(num_tris):
+        if sample_indices is not None and i not in sample_indices:
+            continue
+        offset = 84 + i * 50
+        tri_pts = []
+        for j in range(3):
+            v = np.frombuffer(data[offset+12+j*12:offset+24+j*12], dtype=np.float32)
+            # 正交投影到 XY 平面，居中
+            px = img_size/2 + (v[0] - center[0]) * auto_scale * scale
+            py = img_size/2 + (v[2] - center[2]) * auto_scale * scale  # Z 朝上
+            tri_pts.append((px, py))
+        draw.polygon(tri_pts, fill='lightblue', outline='darkblue', width=1)
+        tri_count += 1
+    
+    # 角标信息
+    info = f"Tris: {tri_count}/{num_tris} | Size: {max_range*auto_scale*scale:.0f}px"
+    draw.text((10, 10), info, fill='black')
+    img.save(output_path)
+    print(f"2D preview saved: {output_path}")
+    return True
+```
+
+**决策矩阵：用哪个预览方案：**
+
+| 文件大小 | 三角面数 | 预览方案 | 耗时 |
+|---------|---------|---------|------|
+| < 2MB | < 5 万 | Blender EEVEE 直接渲染 | ~5s |
+| 2-10MB | 5-20 万 | 先 2D 线框确认形状，再 Blender 渲染 | ~15s |
+| > 10MB | > 20 万 | 仅 2D 线框（采样 10%），告知用户文件过大 | < 5s |
+
+### 长条/细长物体的 ORTHO 侧视图构图策略
+
+> **核心教训来自 FFAR1 武器模型（140mm 长 × 18mm 宽 × 46mm 高）。** ORTHO 相机从侧面拍时，物体在画面中仅占 13.8%，用户反馈："看不到全貌"。
+
+**问题根源：** 武器侧对着 ORTHO 相机时，水平方向（X 轴）看的是物体宽度方向（18mm），垂直方向（Z 轴）看的是高度（46mm），而深度方向（Y 轴、长轴 140mm）被压扁不可见 → 画面 86% 是背景。
+
+**渲染前必须执行的填充率检查：**
+
+```python
+from PIL import Image
+import numpy as np
+
+def check_render_fill(render_path, bg_color_rgb=(242, 242, 255), tolerance=30):
+    """检查渲染图中物体占画面的百分比"""
+    img = Image.open(render_path).convert('RGB')
+    arr = np.array(img)
+    
+    # 背景像素检测：所有通道都在 bg_color ± tolerance 范围内
+    bg_r, bg_g, bg_b = bg_color_rgb
+    is_bg = (
+        (np.abs(arr[:,:,0].astype(int) - bg_r) < tolerance) &
+        (np.abs(arr[:,:,1].astype(int) - bg_g) < tolerance) &
+        (np.abs(arr[:,:,2].astype(int) - bg_b) < tolerance)
+    )
+    
+    object_pixels = (~is_bg).sum()
+    total_pixels = arr.shape[0] * arr.shape[1]
+    fill_ratio = object_pixels / total_pixels * 100
+    
+    print(f"Object fills {fill_ratio:.1f}% of frame")
+    if fill_ratio < 25:
+        print(f"⚠️ 物体仅占画面 {fill_ratio:.1f}% 以下，用户会反馈"看不到全貌"")
+        print(f"  → 建议缩小 ORTHO scale 或拉近相机")
+    elif fill_ratio > 90:
+        print(f"⚠️ 物体几乎占满画面 ({fill_ratio:.1f}%)，用户看不到整体轮廓")
+        print(f"  → 建议扩大 ORTHO scale 或拉远相机")
+    else:
+        print(f"✅ 填充率合理 ({fill_ratio:.1f}%)")
+    return fill_ratio
+```
+
+**侧视图 ORTHO scale 自动计算公式：**
+
+```python
+# 侧视图的可见尺寸：看哪两个轴？
+# 从 Y 负方向看（侧视）：可见 Y×Z 投影（深度 × 高度）
+visible_x = obj.dimensions.y  # Y = 深度方向 → 水平轴
+visible_z = obj.dimensions.z  # Z = 高度方向 → 垂直轴
+longest_visible = max(visible_x, visible_z)
+
+# 目标：让最长可见轴占画面 70%
+# ORTHO scale = 半画幅宽度，所以 = 最长可见轴 / 2 / 目标填充率
+target_fill = 0.70  # 70%
+ortho_scale = (longest_visible / 2) / target_fill  # 约 100mm 对 140mm 长轴
+
+# 对侧面相机，正确的相机位置和旋转：
+# 从 Y 负方向看 → 相机在 (0, -distance, z_offset)
+camera_distance = longest_visible * 1.5  # 1.5 倍足够，因为 ORTHO 不受距离影响
+camera_height = obj.dimensions.z / 2     # 让物体垂直居中
+camera.location = (0, -camera_distance, camera_height)
+```
+
+**对比：PERSP 和 ORTHO 哪个更适合侧视：**
+
+| 方面 | ORTHO | PERSP |
+|------|-------|-------|
+| 长条物体 | ❌ 最短轴方向画面浪费严重 | ✅ 透视自然压缩远距离，空间利用好 |
+| 用户理解难度 | ❌ 物体看起来扁/怪 | ✅ 模拟人眼，更自然 |
+| 推荐度 | 仅用于俯视或正视图 | 侧视和透视图首选 |
+| 特别注意 | 侧视时需手动调整 scale | 需确认 lens 焦距足够（lens ≥ 85 避免鱼眼变形） |
+
 ## Verification
 
-After generating STLs (do this BEFORE rendering or sending to user):
+### 🔬 Mandatory: Quality self-check before sending to user
 
+**User's hard rule:** Before sending any model to the user, you MUST perform a strict self-check comparing reference image(s) against the actual STL. Ask two questions:
+1. **是不是一个东西？** — Does the STL match the reference object's category and overall silhouette?
+2. **是不是一个档次？** — Does the STL have comparable detail level? (Not expecting game-grade polish, but it should be recognizably the same object with the key parts present.)
+
+**Procedure:**
+1. Load at least 2-3 reference images (re-analyze with vision_analyze with specific questions)
+2. Build a **part inventory** from the reference: list every visible component (barrel, muzzle device, handguard, receiver, grip, magazine, stock, sights, trigger guard, etc.)
+3. Compare STL against the inventory — check for missing parts explicitly
+4. Check triangle count: <1000面 = rough shapes only, fine details invisible. Game weapon models need 3000-5000+ faces. **376面以下的STL不可接受用于武器/角色模型** — 这是numpy-stl box组合的典型面数，产生的模型"看不出样子"。
+5. Only if the model passes all checks → send to user
+6. If it doesn't pass, explain honestly what's missing and offer to improve or ask for more/better reference
+
+**⚠️ 关键：vision_analyze（GLM-4v）在几何参照场景下不可靠**
+
+> **2026-06-09 更新**: 发现 Qwen3-VL-Plus（阿里百炼，¥2.5-5/M tokens）具有明确的"空间感知"能力，应替代 GLM-4v 用于 3D 模型参考分析。详见 `references/qwen3-vl-plus-vision-for-3d.md`。
+
+经过多次验证，GLM-4v 在分析武器/模型截图时会出现**明确幻觉**——即给出的描述不是"模糊"，而是**错误的**：
+- 报告中称"没有枪口制退器"——实际参考图中制退器明显可见
+- 称"垂直握把"——实际握把有明显倾斜角度
+- 称"看不到弹匣"——实际弹匣在侧面明显可见
+- 同一张渲染图，GLM先后报告过"没有枪口制退器"、"黑色矩形网格"（实际是浅色背景）
+
+**正确做法：**
+1. vision_analyze 只用于**概览型审查**（"这大概是什么类型的东西"），**不能用于获取精确的部件几何数据**（尺寸、角度、位置关系）
+2. 部件几何数据来自：B站4K无UI展示视频的截图、官方概念图、纸板手工拆解图——这些都是人类设计师制作的参考，不需要AI解读
+3. 建模前，用**人工肉眼**（你自己的推理）从参考图提取部件信息：枪管长度比例、握把角度、弹匣位置、枪托形状
+4. 只有当你看到参考图中一个部件**确实有明确轮廓**时，才把它建进模型。GLM说"看不见"不代表真的没有
+
+**When vision_analyze gives vague descriptions** (e.g. "流线型" "复杂几何" with no specific geometry): Do NOT model based on one vague call. Analyze each reference image independently with specific questions about each part. Note which parts have reliable data vs. which are conjectural. If GLM reports a part as "不存在" but your own reasoning from the reference image says it should be there, trust your reasoning — GLM hallucinates absence as often as presence.
+
+After generating STLs (do this BEFORE rendering or sending to user):
+After generating STLs (do this BEFORE rendering or sending to user):
 > For one-piece boolean UNION models, see `references/one-piece-boolean-union.md` for the dedicated verification procedure including bottom-flatness check and vertex-range analysis.
 > For cartoon character models (animals, mascots, action figures), see `references/cartoon-character-modeling.md` for the complete part-inventory checklist and feature-building guide — run the verification script there before sending to the user.
+> For weapon/mecha models, see `references/weapon-blender-modeling.md` for tool-selection guidance and Blender 5.x export fix.
+For the contour extraction + gaussian smoothing + side-profile extrusion pipeline, see `references/contour-extraction-smoothing-pipeline.md`.
+> For headless Blender rendering failure (uniform gray renders), see `references/ffar1-modeling-case-study.md` — the lesson is to skip EEVEE and use `scripts/stl_2d_preview.py` instead.
+> For Blender headless modifier failure (SUBSURF/MIRROR apply silently fails), see `references/blender-modifier-headless-pitfall.md` and `references/blender-headless-bmesh-subdivide.md`.
+> For editing an existing STL (add features / cut parts / merge), see `references/stl-editing-workflow-case-study.md` and the **STL 编辑工作流** section above.
+> For rebuilding from an approved model's render contour (approved silhouette → contour extraction → fresh side-extrusion rebuild → add details), see `references/approved-model-contour-rebuild.md`.
+> For user-provided task briefs in numbered checklist format, see `references/user-task-brief-protocol.md`.
 
 After generating STLs (do this BEFORE rendering or sending to user):
 1. **Check STL bounding box** — verify all axes have sensible ranges (not < 2mm, not in negative Z):
@@ -1257,7 +2636,10 @@ After generating STLs (do this BEFORE rendering or sending to user):
 
 ## Pitfalls
 
-- **numpy-stl's Mode**: Must import `from stl import Mode` explicitly, then use `Mode.BINARY` / `Mode.ASCII`. ASCII mode is readable but ~5x larger — only use for debugging.
+### Pitfalls
+
+- **Point-cloud preview limitations for box-composite models**: When using pure numpy-stl (no Blender), the only preview option is 2D point cloud projection via Pillow. AI vision models **cannot recognize weapon/vehicle shapes** from these point cloud images — they see random dots, not a gun shape. The model only looks correct when opened in a 3D viewer (STL file opened in Preview.app, Bambu Studio, etc.). **Always send the raw STL file to the user** (via MEDIA:) alongside the 2D preview, or ask them to open it locally. Do not iterate blindly on visual feedback from point cloud previews — the model is likely fine, the preview is just inadequate.
+- **numpy-stl's Mode in binary export**: Must import `from stl import Mode` explicitly, then use `Mode.BINARY` / `Mode.ASCII`. ASCII mode is readable but ~5x larger — only use for debugging.
 - **Face winding**: All triangle faces must have outward-pointing normals. Bottom faces (z=z0) and top faces (z=z1) need opposite winding. The `_extrude` helper handles this — don't try to hand-code vertex ordering without it.
 - **Decimal precision**: STL is ASCII float text; coordinate drift >0.1mm matters. Use `np.float64` for vertex arrays.
 - **Too-few polygon segments**: <12 segments for circles creates visible faceting on curved surfaces. 16-24 is the sweet spot for desktop FDM (which can't resolve finer than 0.1mm anyway).
@@ -1268,4 +2650,5 @@ After generating STLs (do this BEFORE rendering or sending to user):
 - **No "blind trial" rendering**: If user says "all black", **first check STL vertex bounds** to confirm model dimensions and position are sane. The problem could be the STL itself (wrong scale, wrong position, squished axis) — not just render settings. Don't switch render engines 3+ times without first verifying the input geometry. See `references/debug-render-all-black.md` for a case study.
 - **numpy-stl merge_meshes = green blob**: Simply merging overlapping numpy-stl meshes with `_merge_meshes()` retains all internal faces, producing a "green blob" that AI vision models cannot recognize. **Character models must use boolean UNION** (Blender or trimesh) to eliminate internal faces. Pure numpy-stl overlap merging is only acceptable for phone cases and other non-organic models where overlapping regions are minimal.
 - **Blender boolean UNION + Decimate = detail loss**: Applying a Decimate modifier after boolean UNION destroys small features (eyes, mouth, fingers). A 2943-vertex model decimated to 0.25 becomes 733 vertices — facial features disappear. **Never decimate character models**. Use `bmesh.ops.remove_doubles()` to clean up duplicate vertices instead. SUBSURF at levels=1 produces reasonable file size without decimation.
+- **Blender headless modifier apply fails silently** — SUBSURF, MIRROR, BOOLEAN, ARRAY, BEVEL all fail in `--background` mode. See `references/blender-modifier-headless-pitfall.md` for the diagnosis and manual symmetry workaround. For face-count increase without SUBSURF, see `references/blender-headless-bmesh-subdivide.md` for the `bmesh.subdivide_edges` pattern.
 - **Vision unavailable protocol**: When `vision_analyze` fails (401/400) or AI vision can't identify a render: (1) check STL vertex bounds first, (2) generate 2D line-art preview with Pillow (no Blender), (3) send raw files to user via MEDIA: for them to see directly.

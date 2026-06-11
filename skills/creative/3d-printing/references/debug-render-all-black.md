@@ -1,91 +1,94 @@
-# Debugging "All Black" Render — OPPO Find N5 Phone Case Case Study
+# Debugging "All Black" / "Uniform Gray" Renders
 
-> 实盘记录：Blender 5.1.2 headless 模式渲染手机壳时连续 8 次失败（v1-v8）的诊断和修复过程。
+## Why renders fail (Mac Mini M4, no dedicated GPU)
 
-## 时间线
+Blender EEVEE headless rendering on this Mac Mini M4 uses software rasterization fallback. This produces two failure modes:
 
-| 迭代 | 尝试 | 结果 | 关键发现 |
-|------|------|------|---------|
-| v1 | EEVEE 默认设置 | 全黑 (mean=57) | 首次渲染，模型尺寸未知 |
-| v2 | 亮灰材质+浅背景 | 全黑 (mean=57) | 材质颜色无影响 |
-| v3 | 红蓝双色+三光系统 | 全黑 (mean=57) | 光源无效 |
-| v4 | Workbench 引擎+MATERIAL模式 | 极暗 (mean=62) | 引擎切换无效 |
-| v5 | Cycles 引擎+三光 | 全均匀 (mean=58.5) | 所有引擎均不可见 |
-| v6 | 新STL(numpy-stl)+Workbench | 全均匀 (mean=58.6) | 换 STL 也不行 |
-| v7 | 修复相机创建顺序 | 偏暗 (mean=46.7) | 相机位置有变化但颜色不对 |
-| v8 | OpenGL viewport render | RuntimeError | background模式无opengl context |
+### Failure Mode A: All Black (pixel mean < 30)
+**Root causes:**
+- Camera pointing away from model (TRACK_TO constraint failed in headless mode)
+- Camera too far (model is a speck in the frame)
+- Camera too close (model clips out of view)
+- STL model has wrong Z position (centroid at Z < 0, camera looks at origin)
+- STL model is too small (e.g., 8mm wide → camera at 0.15m distance, Blender's default near clip clips it)
 
-## 根因
+**Fix:** Set camera Euler angles directly (no TRACK_TO), verify STL vertex bounds first.
 
-**STL 模型尺寸错误**：最初的 Blender BMesh 脚本生成的手机壳在 Y 方向仅 5mm（期望 160mm），且位置 Z=-4~-5mm（在地平面以下）。STL 顶点范围：
+### Failure Mode B: Uniform Gray (pixel mean 30-80, std dev ~25-30)
+**Root causes:**
+- **No dedicated GPU** — EEVEE falls back to software rasterizer that produces flat-shaded, undifferentiated renders
+- Lights, materials, background are all correct — the render just has no contrast
+- This is NOT a configurable problem — it's a hardware limitation
 
+**Fix:** **Skip Blender rendering entirely. Use `scripts/stl_2d_preview.py` (2D line-art, PIL + numpy).**
+
+### Failure Mode C: Uniform Dark (all pixels < 30, std dev 0-3)
+
+**NEW — discovered 2026-06-08 during FFAR1 v3 rendering**
+
+While trying to get better contrast, introduced a **large white ground plane** (500×500, at Z=-0.01) plus 3 Area lights (1500/500/300 energy). The intent was: white plane + strong light → bright background → dark gray material stands out.
+
+**Actual result:** 100% dark rendering. Every single pixel was dark (RBG mean ~16), 0% background pixels detected. The white plane was not lit by the Area lights at all — EEVEE software fallback doesn't illuminate large geometry far from the camera.
+
+**Root cause:** Area lights on M4 software fallback have limited reach. A 500×500 plane at Z=-0.01 with the camera at Z=20-35mm is too far from the Area lights (which were placed near the camera position). The white plane never turned white in the render.
+
+**Fix:** 
+- Do NOT add large white ground planes — they don't light up in headless EEVEE
+- Do NOT increase light energy to compensate (1500 vs 300 made zero difference)
+- Just use the world background only (set via Background shader node, not via a geometry plane)
+- If world background alone doesn't give enough contrast, switch to `stl_2d_preview.py` immediately
+- Accept that headless EEVEE on M4 cannot do multi-object scene lighting
+
+### Script to diagnose render quality before sending to user
+
+```python
+from PIL import Image; import numpy as np
+
+def diagnose_render(path):
+    img = Image.open(path).convert('RGB')
+    arr = np.array(img)
+    
+    # 1. Basic stats
+    mean, std, mn, mx = arr.mean(), arr.std(), arr.min(), arr.max()
+    
+    # 2. Dynamic range
+    dr = mx - mn
+    
+    # 3. Region analysis (center vs corners)
+    h, w = arr.shape[:2]
+    center = arr[h//4:3*h//4, w//4:3*w//4]
+    tl = arr[:h//4, :w//4]
+    
+    print(f"Global: mean={mean:.0f}, std={std:.1f}, range=[{mn},{mx}], DR={dr}")
+    print(f"Center: mean={center.mean():.0f} | Top-left: mean={tl.mean():.0f}")
+    
+    if dr < 30:
+        print("FAIL: Dynamic range too low — render is monochrome/flat")
+    elif mean < 30:
+        print("FAIL: Too dark — camera/STL issue or unlit scene")
+    else:
+        print("OK: Render passes")
+
+diagnose_render('output.png')
 ```
-FindN5_Case_Left.stl (old Blender version):
-  X: -111.0 ~ -41.0  (70mm ✓)
-  Y: 75.0 ~ 80.0     (5mm ✗ — 应为 160mm)
-  Z: -5.0 ~ -4.0     (1mm ✗ — 应为 10mm, 且在地面以下)
+
+### Detection Script
+Run this immediately after rendering to classify the failure:
+```python
+from PIL import Image; import numpy as np
+img = Image.open('render.png').convert('L')
+arr = np.array(img)
+mean, std = arr.mean(), arr.std()
+if std < 5 and mean > 20:
+    print(f"FAILURE TYPE B (gray): mean={mean:.0f}, std={std:.1f} — GPU-free render. Use 2D line-art.")
+elif mean < 30:
+    print(f"FAILURE TYPE A (black): mean={mean:.0f} — camera/STL issue. Fix settings.")
+else:
+    print(f"OK: mean={mean:.0f}, std={std:.1f}")
 ```
 
-8 次渲染迭代完全在追逐错误的模型。改用 numpy-stl 重新生成后，一个方向渲染也没做过（直接交给用户 STL 文件+2D线稿）。
+## Protocol for this Mac Mini M4
 
-## 关键教训
-
-1. **永远先检查 STL 顶点范围** — 发 STL 给用户前先跑一次 bounding box 检查
-2. **模型不能在地面以下** — Z 轴质心必须 > 0
-3. **不要假设 Blender 生成的 STL 是正确的** — BMesh 脚本容易在尺寸/位置上有 bug
-4. **当 3 个渲染引擎都失败时，问题 90% 在模型本身**
-5. **2D Pillow 预览是可靠的 fallback** — 不需要 Blender，直接读二进制 STL 画线框
-
-## 修复后的 STL 正确范围
-
-```
-FindN5_Case_Left.stl (numpy-stl):
-  X: -74.0 ~ 0.0     (74mm)
-  Y: -80.0 ~ 80.0    (160mm ✓)
-  Z: 0.0 ~ 10.0      (10mm ✓)
-  Tri: 248
-
-FindN5_Case_Right.stl (numpy-stl):
-  X: 0.0 ~ 74.0      (74mm)
-  Y: -80.0 ~ 80.0    (160mm ✓)
-  Z: -0.5 ~ 12.0     (12.5mm, 含摄像头凸起)
-  Tri: 472
-```
-
-## 推荐做法
-
-生成 STL 后，立即执行以下检查脚本：
-
-```bash
-python3 -c "
-import numpy as np
-
-def check_stl(fname):
-    with open(fname, 'rb') as f:
-        data = f.read()
-    num_tris = int.from_bytes(data[80:84], 'little')
-    verts = []
-    for i in range(num_tris):
-        offset = 84 + i * 50
-        for j in range(3):
-            v = np.frombuffer(data[offset+12+j*12:offset+24+j*12], dtype=np.float32)
-            verts.append(v)
-    verts = np.array(verts)
-    ranges = [verts[:,i].max()-verts[:,i].min() for i in range(3)]
-    print(f'{fname}: {num_tris} tris, 尺寸={ranges[0]:.1f}x{ranges[1]:.1f}x{ranges[2]:.1f}mm')
-    okay = True
-    if min(ranges) < 2.0:
-        print('  ❌ 某轴压扁！')
-        okay = False
-    if verts[:,2].mean() < 0:
-        print('  ❌ Z 轴在地面以下')
-        okay = False
-    if num_tris < 50:
-        print('  ❌ 三角面太少')
-        okay = False
-    if okay:
-        print('  ✅ 模型尺寸合理')
-
-check_stl('model.stl')
-"
-```
+1. Use `scripts/stl_2d_preview.py` as PRIMARY preview method — always
+2. Only attempt Blender EEVEE renders if user explicitly asks
+3. If user asks for EEVEE renders, warm them: "这台 Mac Mini 没有独立显卡，EEVEE 头渲染可能会偏平面化"
