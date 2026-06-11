@@ -456,6 +456,62 @@ agentic-self-improvement/
     └── apply_and_verify.py         # Apply patches with auto-revert
 ```
 
+---
+
+## Part 5: Model Quality & Latency Comparison
+
+Use when choosing between LLM providers or validating a model change. Complements the behavioral benchmarks (Part 1) — those test **tool-calling behavior**, this tests **response quality and speed**.
+
+### When to Use
+
+- Evaluating a new provider or model
+- Before switching the default model in `config.yaml`
+- Investigating user complaints about speed or quality
+- After a provider API change or model deprecation
+
+### Usage
+
+```bash
+# Edit models/tests in the script, then run:
+python3 ~/.hermes/skills/agentic-self-improvement/scripts/model-quality-benchmark.py
+
+# Or save results to JSON:
+python3 ~/.hermes/skills/agentic-self-improvement/scripts/model-quality-benchmark.py --output /tmp/benchmark.json
+```
+
+### What It Measures
+
+| Dimension | What it tests | Weight |
+|-----------|---------------|--------|
+| Latency | Basic response speed (simple greeting) | 2x |
+| Chinese understanding | Idioms, puns, cultural references | 2x |
+| Writing quality | Natural tone, no clichés, appropriate style | 1x |
+| Reasoning | Multi-step logic with constraints | 2x |
+| Code generation | Bash/Python one-liner correctness | 1x |
+| Tool call tendency | Does it attempt to use tools vs answering from memory? | 2x |
+| Long context | Information extraction from repetitive text | 1x |
+| Multilingual | Translation + cultural explanation | 1x |
+
+### Customization
+
+**Edit `model-quality-benchmark.py` directly** — the top of the file has `MODELS` and `TESTS` arrays. For API keys, use `$ENV_VAR_NAME` syntax so keys aren't hardcoded.
+
+### Interpretation
+
+- **Latency delta > 5x** is a dealbreaker for interactive use (Agent sessions)
+- **Tool-calling failure** (timeout/disconnect) is a hard fail — don't use that model for agentic tasks
+- **Pass rate** matters less than latency for simple tests — 8/8 is typical, a 7/8 with one timeout is worse than 8/8 on a slower model
+- Weighted scoring: latency (2x) + tool (2x) + reasoning (2x) > writing (1x) for agent use cases
+
+### Pitfalls
+
+- **Proxy requirements**: If the provider is behind a firewall, set `PROXIES` at the top of the script before running
+- **Temperature**: Keep at 0.3 for reproducible comparisons across runs
+- **Network jitter**: Run each test 2-3 times if latency is close; single-pass results can vary by ±20%
+- **Content caching**: Some providers cache exact prompt matches, making second runs faster than the first
+
+---
+
 ## Pitfalls
 
 - **Benchmark runner path resolution**: When the skill lives under `skills.external_dirs` (shared repo), `benchmark_runner.py` looks for benchmarks in `HERMES_HOME/skills/agentic-self-improvement/BENCHMARKS/` — but the actual benchmarks live in the external dir. Fix: create a symlink once:

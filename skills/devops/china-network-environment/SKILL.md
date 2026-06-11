@@ -96,6 +96,54 @@ pip install <package> -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host
 - **API mirror**: `HOMEBREW_API_DOMAIN=https://mirrors.ustc.edu.cn/homebrew-api`
 - **Note**: Some formulae have no bottle (fall back to source build which may fail)
 
+### GitHub Access: Proxy Pattern vs Mirror Pattern
+
+**The two-tier approach:**
+1. **First try: GitHub mirrors** (`gh.ddlc.top`, `ghproxy.net`, `gh-proxy.com`) — faster for one-off downloads
+2. **If mirrors are unreliable/slow: Use Xray SOCKS5 proxy for direct GitHub access**
+
+```bash
+# Git clone/pull/push through Xray SOCKS5 proxy
+ALL_PROXY=socks5://127.0.0.1:10808 git push   # or pull/clone
+
+# Or export it for a series of commands
+export ALL_PROXY=socks5://127.0.0.1:10808
+export http_proxy=socks5://127.0.0.1:10808
+export https_proxy=socks5://127.0.0.1:10808
+# ... git operations ...
+unset ALL_PROXY http_proxy https_proxy
+```
+
+**Known issue:** Git over HTTPS + SOCKS5 proxy with no credential cache fails with `fatal: could not read Username for 'https://github.com': No such device or address`. The proxy intercepts the credential prompt from the HTTP layer. Fix: ensure git credential helper has cached credentials before the proxy-pathed push (run `git push` once without proxy to cache credentials, or configure a GitHub token as credential).
+
+**When to use which:**
+
+| Pattern | Use Case | Speed |
+|---------|----------|-------|
+| gh.ddlc.top mirror | Large binary downloads (releases, tarballs) | 200-500 KB/s |
+| Xray SOCKS5 + direct GitHub | Git operations (clone/pull/push) | Dial-up limited by node speed |
+| Xray SOCKS5 + direct GitHub | API calls (curl to api.github.com) | Fast (small payloads) |
+
+**Cron script pattern** (for automated sync scripts):
+
+```bash
+#!/bin/bash
+# Sync script that uses Xray proxy
+cd ~/repo || exit 0
+
+export ALL_PROXY=socks5://127.0.0.1:10808
+export http_proxy=socks5://127.0.0.1:10808
+export https_proxy=socks5://127.0.0.1:10808
+
+OLD_HASH=$(git rev-parse HEAD)
+git pull --ff-only || exit 0
+
+unset ALL_PROXY http_proxy https_proxy
+# ... handle new content ...
+```
+
+⚠️ Never put `ALL_PROXY` in `~/.hermes/.env` — see Proxy Isolation section.
+
 ## Proxy Configuration
 
 ### V2rayU (macOS GUI Proxy Client)
